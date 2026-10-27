@@ -14,6 +14,21 @@ int g_port = 0;
 int g_extra_port = 0;
 char g_db_url[2048] = "";
 static char g_jwt_secret[1024] = "";
+#ifdef BUILD_PGO_GEN
+/* Pass 12: PGO profile flush. The instrumented (-fprofile-generate) build
+ * runs a finite mload profile pass and is then SIGTERM'd; a normal signal
+ * death would discard all counters, so dump them explicitly before exit.
+ * Production builds (no BUILD_PGO_GEN) do not install this handler: their
+ * shutdown behavior is unchanged.
+ * The profile-use rebuild keeps -DBUILD_PGO_GEN so main keeps an identical CFG (else its arc counts mismatch); there __gcov_dump is a NULL weak ref and the handler just exits.
+ */
+void __gcov_dump(void) __attribute__((weak));
+static void pgo_term_handler(int sig) {
+    (void)sig;
+    if (__gcov_dump) __gcov_dump();
+    _exit(0);
+}
+#endif
 struct timespec g_start_mono;
 
 static const char *req_env(const char *k) {
@@ -26,6 +41,11 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     sigset_t ss; sigemptyset(&ss); sigaddset(&ss, SIGPIPE);
     sigprocmask(SIG_BLOCK, &ss, NULL);
+#ifdef BUILD_PGO_GEN
+    { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = pgo_term_handler;
+      sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
+      sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL); }
+#endif
 
     clock_gettime(CLOCK_MONOTONIC, &g_start_mono);
 

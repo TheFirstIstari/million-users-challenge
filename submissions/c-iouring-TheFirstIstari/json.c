@@ -117,22 +117,30 @@ static const unsigned char ESCLEN[256] = {
     0, 0, 0, 0, 0, 0, 0, 0
 };
 
-/* Table-driven escape: identical output to the branchy version (same caps, 
- * same lowercase hex for control chars, same truncation behavior). */
+/* Table-driven escape: identical output to the branchy version (same caps,
+ * same lowercase hex for control chars, same truncation behavior).
+ * Pass 9: bulk-copy runs of plain bytes (memcpy) instead of byte-at-a-time
+ * when no escape is needed; per-char output for runs is bit-identical. */
 size_t json_escape_n(const char *src, size_t n, char *dst, size_t cap) {
     size_t o = 0;
     if (cap == 0) return 0;
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+    while (i < n) {
         unsigned char c = (unsigned char)src[i];
-        const char *e = ESC[c];
-        if (e == 0) {
-            if (o + 1 >= cap) break;
-            dst[o++] = (char)c;
+        if (ESC[c] == 0) {
+            size_t j = i + 1;
+            while (j < n && ESC[(unsigned char)src[j]] == 0) j++;
+            size_t run = j - i;
+            size_t room = (o + 1 >= cap) ? 0 : (cap - 1 - o);
+            size_t k = run < room ? run : room;
+            if (k) { memcpy(dst + o, src + i, k); o += k; i += k; }
+            if (k < run) break;
         } else {
             size_t el = ESCLEN[c];
             if (o + el >= cap) break;
-            memcpy(dst + o, e, el);
+            memcpy(dst + o, ESC[c], el);
             o += el;
+            i++;
         }
     }
     if (o < cap) dst[o] = '\0';

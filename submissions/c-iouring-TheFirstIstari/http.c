@@ -1,7 +1,9 @@
 #include "http.h"
+#include "net.h"
 #include "json.h"
 #include "jwt.h"
 #include "pg.h"
+#include <libpq-fe.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -9,6 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <zlib.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -17,14 +20,6 @@
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
-
-/* conn_ctx is defined in net.c; mirror the fields we need. */
-struct conn_ctx {
-    int fd;
-    unsigned int req_count;
-    time_t last_active;
-    int keep_alive;
-};
 
 /* Thread-local scratch for decoded POST bodies (raw cap 16K + slack). */
 static _Thread_local char t_dec[17408];
@@ -116,7 +111,18 @@ int http_parse(const char *buf, size_t len, http_req_t *out) {
             } else if (ci_eq(nm, nl, "connection")) {
                 out->connection = vs; out->connection_len = vl;
             } else if (ci_eq(nm, nl, "accept-encoding")) {
-                /* scanned only; we always send identity. */
+                /* Pass 7: feed-first gzip. Token search, case-insensitive,
+                 * separators are comma/space/tab/semicolon. */
+                for (size_t k = 0; k + 4 <= vl; k++) {
+                    if (((vs[k] | 32) == 'g') && ((vs[k+1] | 32) == 'z') &&
+                        ((vs[k+2] | 32) == 'i') && ((vs[k+3] | 32) == 'p')) {
+                        char pb = (k == 0) ? ',' : vs[k-1];
+                        char nb = (k + 4 >= vl) ? ',' : vs[k+4];
+                        int pok = (pb == ',' || pb == ' ' || pb == '\t');
+                        int nok = (nb == ',' || nb == ' ' || nb == '\t' || nb == ';');
+                        if (pok && nok) { out->accept_gzip = 1; break; }
+                    }
+                }
             } else if (ci_eq(nm, nl, "host")) {
                 /* scanned only. */
             }
@@ -135,7 +141,8 @@ int http_parse(const char *buf, size_t len, http_req_t *out) {
 int http_send(int fd, const char *hdr, size_t hlen, const char *body, size_t blen) {
     /* Header + body coalesced into one sendmsg (single syscall typically,
      * MSG_NOSIGNAL). Same contract as before: any transport error (incl.
-     * EAGAIN on the nonblocking fd) fails and the caller closes. */
+     * EAGAIN on the nonblocking fd) fails and the caller closes. Kept for
+     * compat; the conn path below (send_via_conn) is used instead. */
     struct iovec iv[2];
     iv[0].iov_base = (void *)hdr; iv[0].iov_len = hlen;
     iv[1].iov_base = (void *)body; iv[1].iov_len = blen;
@@ -168,6 +175,80 @@ int http_send(int fd, const char *hdr, size_t hlen, const char *body, size_t ble
     return 0;
 }
 
+/* Stash cap for an unsent response: a slow client can hold at most this many
+ * bytes before we close instead of growing (bounds per-conn memory). */
+#define WSTASH_CAP (256 * 1024)
+
+/* Pass 9 conn-aware send: still a single coalesced sendmsg on the fast
+ * path. On EAGAIN (sndbuf full under load) the remainder is stashed in the
+ * conn and the fd is EPOLLOUT re-armed instead of closing: the event loop
+ * drains it before parsing more requests, preserving response order.
+ * Returns 0 (sent or stashed; conn stays open), -1 on transport error or
+ * stash overflow (caller must close). */
+static int send_via_conn(struct conn_hot *c, const char *hdr, size_t hlen,
+                         const char *body, size_t blen) {
+    struct iovec iv[2];
+    iv[0].iov_base = (void *)hdr; iv[0].iov_len = hlen;
+    iv[1].iov_base = (void *)body; iv[1].iov_len = blen;
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = iv;
+    mh.msg_iovlen = (blen > 0) ? 2 : 1;
+    size_t total = hlen + blen, off = 0;
+    while (off < total) {
+        ssize_t r = sendmsg(c->fd, &mh, MSG_NOSIGNAL);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+            break; /* stash the remainder below */
+        }
+        if (r == 0) return -1;
+        off += (size_t)r;
+        size_t left = (size_t)r;
+        while (left > 0 && mh.msg_iovlen > 0) {
+            if (left >= mh.msg_iov->iov_len) {
+                left -= mh.msg_iov->iov_len;
+                mh.msg_iov++;
+                mh.msg_iovlen--;
+            } else {
+                mh.msg_iov->iov_base = (char *)mh.msg_iov->iov_base + left;
+                mh.msg_iov->iov_len -= left;
+                left = 0;
+            }
+        }
+    }
+    if (off == total) return 0;
+    /* Would-block: stash [off,total) of the hdr+body concat, in order.
+     * A pre-existing stash (pipelined stall) is appended to, preserving
+     * response order; it is drained before any further parsing. */
+    size_t rem = total - off;
+    if (c->cold->wlen + rem > WSTASH_CAP) return -1;
+    char *nb;
+    if (c->cold->wbuf) {
+        nb = realloc(c->cold->wbuf, c->cold->wlen + rem);
+        if (!nb) return -1;
+        c->cold->wbuf = nb;
+    } else {
+        nb = malloc(rem);
+        if (!nb) return -1;
+        c->cold->wbuf = nb; c->cold->wlen = 0; c->cold->woff = 0;
+    }
+    size_t copied = 0;
+    if (off < hlen) {
+        size_t k = hlen - off;
+        memcpy(c->cold->wbuf + c->cold->wlen, hdr + off, k);
+        copied = k;
+    }
+    {
+        size_t boff = (off > hlen) ? off - hlen : 0;
+        size_t k = blen > boff ? blen - boff : 0;
+        if (k) memcpy(c->cold->wbuf + c->cold->wlen + copied, body + boff, k);
+    }
+    c->cold->wlen += rem;
+    if (net_arm_out(c) != 0) return -1;
+    return 0;
+}
+
 /* Route helpers */
 static int target_eq(const http_req_t *rq, const char *s) {
     size_t n = strlen(s);
@@ -189,9 +270,9 @@ static int valid_id(const char *s, size_t n, unsigned long long *v) {
 }
 
 /* Auth check for protected routes. 0 ok (sub/user filled), -1 + 401 sent. */
-static void send_resp(struct conn_ctx *c, const http_req_t *rq, int code, const char *reason,
+static void send_resp(struct conn_hot *c, const http_req_t *rq, int code, const char *reason,
                       const char *body, size_t blen, int force_close);
-static int check_auth(struct conn_ctx *c, const http_req_t *rq,
+static int check_auth(struct conn_hot *c, const http_req_t *rq,
                       char *sub, size_t subcap, char *user, size_t usercap) {
     const char *emsg = NULL;
     if (unlikely(!rq->auth || rq->auth_len <= 7 || memcmp(rq->auth, "Bearer ", 7) != 0)) {
@@ -247,8 +328,47 @@ static char *append_u64(char *p, size_t v) {
     return p;
 }
 
-static void send_resp(struct conn_ctx *c, const http_req_t *rq, int code, const char *reason,
-                      const char *body, size_t blen, int force_close) {
+/* ---- Pass 7: feed-first gzip (level 1, gzip framing) ---- */
+
+#define GZIP_MIN_POST 1024
+/* Worst-case input is t_feed (128 KiB); deflate output can exceed input
+ * slightly on incompressible data, so keep 136 KiB of thread-local room. */
+#define GZ_CAP 139264
+
+static _Thread_local z_stream t_zs;
+static _Thread_local int t_zs_init = 0;
+static _Thread_local unsigned char t_gz[GZ_CAP];
+
+/* Compress in[0..ilen) into thread-local t_gz. 0 ok (out+olen set), -1 on
+ * failure (caller falls back to identity, byte-exact). No malloc. */
+static int gzip_compress(const char *in, size_t ilen,
+                         const unsigned char **out, size_t *olen) {
+    if (!t_zs_init) {
+        memset(&t_zs, 0, sizeof t_zs);
+        if (deflateInit2(&t_zs, Z_BEST_SPEED, Z_DEFLATED,
+                         15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+            return -1;
+        t_zs_init = 1;
+    } else {
+        if (deflateReset(&t_zs) != Z_OK)
+            return -1;
+    }
+    t_zs.next_in = (Bytef *)in;
+    t_zs.avail_in = (uInt)ilen;
+    t_zs.next_out = t_gz;
+    t_zs.avail_out = (uInt)sizeof t_gz;
+    int rc = deflate(&t_zs, Z_FINISH);
+    if (rc != Z_STREAM_END)
+        return -1;
+    *out = t_gz;
+    *olen = sizeof t_gz - t_zs.avail_out;
+    return 0;
+}
+
+static const char ENC_GZIP[] = "\r\nContent-Encoding: gzip";
+
+static void send_resp_ex(struct conn_hot *c, const http_req_t *rq, int code, const char *reason,
+                         const char *body, size_t blen, int force_close, int allow_gzip) {
     const char *st = NULL;
     size_t sl = 0;
     switch (code) {
@@ -261,17 +381,39 @@ static void send_resp(struct conn_ctx *c, const http_req_t *rq, int code, const 
     case 503: st = ST503; sl = sizeof ST503 - 1; break;
     default: break;
     }
-    char hdr[160];
+    char hdr[256];
     int close_it = force_close || wants_close(rq) || c->req_count >= 999;
     if (likely(st != NULL)) {
+        /* Gzip fast path: only when the route allows it AND the client
+         * asked. Any compression failure falls through to identity. */
+        if (allow_gzip && rq->accept_gzip && body && blen > 0) {
+            const unsigned char *gz = NULL;
+            size_t gzlen = 0;
+            if (gzip_compress(body, blen, &gz, &gzlen) == 0) {
+                char *p = hdr;
+                memcpy(p, st, sl); p += sl;
+                p = append_u64(p, gzlen);
+                memcpy(p, ENC_GZIP, sizeof ENC_GZIP - 1); p += sizeof ENC_GZIP - 1;
+                const char *ce = close_it ? CONN_HDR_CLOSE : CONN_HDR_KEEP;
+                size_t cl = close_it ? sizeof CONN_HDR_CLOSE - 1 : sizeof CONN_HDR_KEEP - 1;
+                memcpy(p, ce, cl); p += cl;
+                if (send_via_conn(c, hdr, (size_t)(p - hdr), (const char *)gz, gzlen) != 0)
+                    c->keep_alive = 0;
+                else
+                    c->keep_alive = !close_it;
+                return;
+            }
+        }
         char *p = hdr;
         memcpy(p, st, sl); p += sl;
         p = append_u64(p, blen);
         const char *ce = close_it ? CONN_HDR_CLOSE : CONN_HDR_KEEP;
         size_t cl = close_it ? sizeof CONN_HDR_CLOSE - 1 : sizeof CONN_HDR_KEEP - 1;
         memcpy(p, ce, cl); p += cl;
-        http_send(c->fd, hdr, (size_t)(p - hdr), body, blen);
-        c->keep_alive = !close_it;
+        if (send_via_conn(c, hdr, (size_t)(p - hdr), body, blen) != 0)
+            c->keep_alive = 0;
+        else
+            c->keep_alive = !close_it;
         return;
     }
     /* Unknown code (defensive; no current caller): printf fallback. */
@@ -281,8 +423,17 @@ static void send_resp(struct conn_ctx *c, const http_req_t *rq, int code, const 
         "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: %s\r\n\r\n",
         code, reason ? reason : "", blen, conn);
     if (hlen < 0 || (size_t)hlen >= sizeof hdr) return;
-    http_send(c->fd, hdr, (size_t)hlen, body, blen);
-    c->keep_alive = !close_it;
+    if (send_via_conn(c, hdr, (size_t)hlen, body, blen) != 0)
+        c->keep_alive = 0;
+    else
+        c->keep_alive = !close_it;
+}
+
+/* Identity wrapper: errors, health, like, create and unknown routes stay
+ * uncompressed so golden-exact fallback is preserved. */
+static void send_resp(struct conn_hot *c, const http_req_t *rq, int code, const char *reason,
+                      const char *body, size_t blen, int force_close) {
+    send_resp_ex(c, rq, code, reason, body, blen, force_close, 0);
 }
 
 /* ---- minimal JSON body parser for POST /posts ---- */
@@ -433,9 +584,97 @@ static int extract_body(const char *b, size_t n, char *dec, size_t deccap,
     return found ? 1 : 0;
 }
 
-int http_respond(struct conn_ctx *c, const http_req_t *rq, long uptime_s) {
+void http_pending_free(struct pg_pending *p) {
+    if (!p) return;
+    free(p->p0); p->p0 = NULL;
+    free(p->p1); p->p1 = NULL;
+    free(p->author); p->author = NULL;
+    free(p->conn_hdr); p->conn_hdr = NULL;
+    p->route = PG_ROUTE_NONE;
+    p->slot = -1;
+    p->sent = 0;
+    p->npar = 0;
+    p->body_len = 0;
+    p->idv = 0;
+    p->ver_major = 1; p->ver_minor = 1;
+    p->conn_hdr_len = 0;
+    p->uptime_s = 0;
+    p->accept_gzip = 0;
+}
+
+static char *dup_str(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char *d = malloc(n + 1);
+    if (!d) return NULL;
+    memcpy(d, s, n + 1);
+    return d;
+}
+
+static const char *stmt_for_route(int route) {
+    switch (route) {
+    case PG_ROUTE_HEALTH: return "q_health";
+    case PG_ROUTE_FEED: return "q_feed";
+    case PG_ROUTE_POST: return "q_post";
+    case PG_ROUTE_MKPOST: return "q_mkpost";
+    case PG_ROUTE_LIKE: return "q_like";
+    default: return NULL;
+    }
+}
+
+/* Stash the request for PG_WAIT and kick the async send.
+ * Returns HTTP_DEFERRED when stashed (caller must arm the PG socket and
+ * stop pipelining), or -1 when the caller should use the blocking fallback
+ * (send error, no PQsocket, or malloc failure). */
+static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
+                      int route, const char *stmt, int npar,
+                      const char *p0, const char *p1,
+                      const char *author, size_t body_len,
+                      unsigned long long idv) {
+    char *cp0 = NULL, *cp1 = NULL, *ca = NULL, *ch = NULL;
+    if (npar > 0 && p0) { cp0 = dup_str(p0); if (!cp0) return -1; }
+    if (npar > 1 && p1) { cp1 = dup_str(p1); if (!cp1) { free(cp0); return -1; } }
+    if (author) { ca = dup_str(author); if (!ca) { free(cp0); free(cp1); return -1; } }
+    if (rq->connection && rq->connection_len) {
+        size_t cn = rq->connection_len;
+        ch = malloc(cn + 1);
+        if (!ch) { free(cp0); free(cp1); free(ca); return -1; }
+        memcpy(ch, rq->connection, cn);
+        ch[cn] = '\0';
+    }
+    int slot = pg_claim_slot();
+    const char *par[2] = { p0, p1 };
+    int rc = pg_send_async(slot, stmt, npar, npar ? par : NULL);
+    int fd = pg_socket(slot);
+    if (fd < 0 || rc == PG_ASYNC_ERR) {
+        free(cp0); free(cp1); free(ca); free(ch);
+        return -1;
+    }
+    c->state = CONN_PG_WAIT;
+    c->cold->pend.route = route;
+    c->cold->pend.slot = slot;
+    c->cold->pend.sent = (rc == PG_ASYNC_OK) ? 1 : 0;
+    c->cold->pend.npar = npar;
+    c->cold->pend.p0 = cp0;
+    c->cold->pend.p1 = cp1;
+    c->cold->pend.author = ca;
+    c->cold->pend.body_len = body_len;
+    c->cold->pend.idv = idv;
+    c->cold->pend.ver_major = rq->ver_major;
+    c->cold->pend.ver_minor = rq->ver_minor;
+    c->cold->pend.conn_hdr = ch;
+    c->cold->pend.conn_hdr_len = rq->connection_len;
+    c->cold->pend.uptime_s = uptime_s;
+    c->cold->pend.accept_gzip = rq->accept_gzip ? 1 : 0;
+    return HTTP_DEFERRED;
+}
+
+int http_respond(struct conn_hot *c, const http_req_t *rq, long uptime_s) {
     /* Validation order: route -> auth -> id -> body -> DB. */
     if (likely(rq->method == 0) && target_eq(rq, "/health")) {
+        int d = http_defer(c, rq, uptime_s, PG_ROUTE_HEALTH, "q_health", 0,
+                           NULL, NULL, NULL, 0, 0);
+        if (d == HTTP_DEFERRED) return HTTP_DEFERRED;
         char err[512]; err[0] = '\0';
         char body[1024];
         size_t bl;
@@ -443,7 +682,7 @@ int http_respond(struct conn_ctx *c, const http_req_t *rq, long uptime_s) {
             bl = json_render_health(body, sizeof body, uptime_s);
             send_resp(c, rq, 200, "OK", body, bl, 0);
         } else {
-            static const char degraded[] = "{\"status\":\"degraded\",\"db\":\"unreachable\"}";
+            static const char degraded[] = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"db unreachable\"}";
             if (!err[0]) snprintf(err, sizeof err, "db unreachable");
             fprintf(stderr, "health degraded: %s\n", err);
             send_resp(c, rq, 503, "Service Unavailable", degraded, sizeof degraded - 1, 0);
@@ -451,11 +690,14 @@ int http_respond(struct conn_ctx *c, const http_req_t *rq, long uptime_s) {
         return c->keep_alive;
     }
     if (likely(rq->method == 0) && target_eq(rq, "/feed")) {
+        int d = http_defer(c, rq, uptime_s, PG_ROUTE_FEED, "q_feed", 0,
+                           NULL, NULL, NULL, 0, 0);
+        if (d == HTTP_DEFERRED) return HTTP_DEFERRED;
         const char *body = NULL;
         size_t bl = 0;
         char err[512];
         if (pg_feed(&body, &bl, err, sizeof err) == 0) {
-            send_resp(c, rq, 200, "OK", body, bl, 0);
+            send_resp_ex(c, rq, 200, "OK", body, bl, 0, 1);
         } else {
             send_resp(c, rq, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
         }
@@ -478,12 +720,15 @@ int http_respond(struct conn_ctx *c, const http_req_t *rq, long uptime_s) {
         }
         char ids[24];
         snprintf(ids, sizeof ids, "%llu", idv);
+        int d = http_defer(c, rq, uptime_s, PG_ROUTE_POST, "q_post", 1,
+                           ids, NULL, NULL, 0, 0);
+        if (d == HTTP_DEFERRED) return HTTP_DEFERRED;
         const char *body = NULL;
         size_t bl = 0;
         char err[512];
         int r = pg_get_post(ids, &body, &bl, err, sizeof err);
         if (r == 0) {
-            send_resp(c, rq, 200, "OK", body, bl, 0);
+            send_resp_ex(c, rq, 200, "OK", body, bl, 0, bl >= GZIP_MIN_POST);
         } else if (r == -2) {
             send_resp(c, rq, 404, "Not Found", JERR_POST_NOT_FOUND, strlen(JERR_POST_NOT_FOUND), 0);
         } else {
@@ -523,6 +768,12 @@ int http_respond(struct conn_ctx *c, const http_req_t *rq, long uptime_s) {
             send_resp(c, rq, 400, "Bad Request", JERR_BODY_TOO_LONG, strlen(JERR_BODY_TOO_LONG), 0);
             return c->keep_alive;
         }
+        int d = http_defer(c, rq, uptime_s, PG_ROUTE_MKPOST, "q_mkpost", 2,
+                           sub, t_dec, user, tl2, 0);
+        if (d == HTTP_DEFERRED) {
+            /* t_dec was copied into pend->p1; safe to reuse. */
+            return HTTP_DEFERRED;
+        }
         const char *body = NULL;
         size_t bl = 0;
         char err[512];
@@ -561,6 +812,9 @@ int http_respond(struct conn_ctx *c, const http_req_t *rq, long uptime_s) {
         }
         char ids[24];
         snprintf(ids, sizeof ids, "%llu", idv);
+        int d = http_defer(c, rq, uptime_s, PG_ROUTE_LIKE, "q_like", 2,
+                           sub, ids, NULL, 0, idv);
+        if (d == HTTP_DEFERRED) return HTTP_DEFERRED;
         int already = 0;
         char err[512];
         int r = pg_like(sub, ids, &already, err, sizeof err);
@@ -584,4 +838,198 @@ int http_respond(struct conn_ctx *c, const http_req_t *rq, long uptime_s) {
     /* Unknown method on known path is out of scope -> 404. Unknown path -> 404. */
     send_resp(c, rq, 404, "Not Found", JERR_NOT_FOUND, strlen(JERR_NOT_FOUND), 0);
     return c->keep_alive;
+}
+
+/* Blocking fallback for a stashed request (send error, lost socket, or poll
+ * transport error). Reuses the exact blocking pg_* path so wire behavior is
+ * identical. Sends the response and tears down the stash. */
+static int resume_blocking(struct conn_hot *c, http_req_t *tmp) {
+    struct pg_pending *p = &c->cold->pend;
+    int route = p->route;
+    int ka = 1;
+    if (route == PG_ROUTE_HEALTH) {
+        char err[512]; err[0] = '\0';
+        char body[1024];
+        size_t bl;
+        if (pg_health_check(err, sizeof err) == 0) {
+            bl = json_render_health(body, sizeof body, p->uptime_s);
+            send_resp(c, tmp, 200, "OK", body, bl, 0);
+        } else {
+            static const char degraded[] = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"db unreachable\"}";
+            if (!err[0]) snprintf(err, sizeof err, "db unreachable");
+            fprintf(stderr, "health degraded: %s\n", err);
+            send_resp(c, tmp, 503, "Service Unavailable", degraded, sizeof degraded - 1, 0);
+        }
+        ka = c->keep_alive;
+    } else if (route == PG_ROUTE_FEED) {
+        const char *body = NULL;
+        size_t bl = 0;
+        char err[512];
+        if (pg_feed(&body, &bl, err, sizeof err) == 0) {
+            send_resp_ex(c, tmp, 200, "OK", body, bl, 0, 1);
+        } else {
+            send_resp(c, tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else if (route == PG_ROUTE_POST) {
+        const char *body = NULL;
+        size_t bl = 0;
+        char err[512];
+        int r = pg_get_post(p->p0 ? p->p0 : "", &body, &bl, err, sizeof err);
+        if (r == 0) {
+            send_resp_ex(c, tmp, 200, "OK", body, bl, 0, bl >= GZIP_MIN_POST);
+        } else if (r == -2) {
+            send_resp(c, tmp, 404, "Not Found", JERR_POST_NOT_FOUND, strlen(JERR_POST_NOT_FOUND), 0);
+        } else {
+            send_resp(c, tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else if (route == PG_ROUTE_MKPOST) {
+        const char *body = NULL;
+        size_t bl = 0;
+        char err[512];
+        if (pg_create_post(p->p0 ? p->p0 : "", p->p1 ? p->p1 : "", p->body_len,
+                           p->author ? p->author : "", &body, &bl, err, sizeof err) == 0) {
+            send_resp(c, tmp, 201, "Created", body, bl, 0);
+        } else {
+            send_resp(c, tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else if (route == PG_ROUTE_LIKE) {
+        int already = 0;
+        char err[512];
+        int r = pg_like(p->p0 ? p->p0 : "", p->p1 ? p->p1 : "", &already, err, sizeof err);
+        if (r == 0) {
+            char lb[96];
+            int n = snprintf(lb, sizeof lb,
+                "{\"liked\":true,\"already_liked\":%s,\"post_id\":%llu}",
+                already ? "true" : "false", p->idv);
+            if (n < 0 || (size_t)n >= sizeof lb) {
+                send_resp(c, tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+            } else {
+                send_resp(c, tmp, already ? 200 : 201, already ? "OK" : "Created", lb, (size_t)n, 0);
+            }
+        } else if (r == -2) {
+            send_resp(c, tmp, 404, "Not Found", JERR_POST_NOT_FOUND, strlen(JERR_POST_NOT_FOUND), 0);
+        } else {
+            send_resp(c, tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else {
+        send_resp(c, tmp, 404, "Not Found", JERR_NOT_FOUND, strlen(JERR_NOT_FOUND), 0);
+        ka = c->keep_alive;
+    }
+    http_pending_free(&c->cold->pend);
+    c->state = CONN_ACTIVE;
+    return ka;
+}
+
+int http_resume(struct conn_hot *c) {
+    if (c->state != CONN_PG_WAIT) return c->keep_alive;
+    struct pg_pending *p = &c->cold->pend;
+    http_req_t tmp;
+    memset(&tmp, 0, sizeof tmp);
+    tmp.method = -1;
+    tmp.ver_major = p->ver_major;
+    tmp.ver_minor = p->ver_minor;
+    tmp.connection = p->conn_hdr;
+    tmp.connection_len = p->conn_hdr_len;
+    tmp.accept_gzip = p->accept_gzip;
+    /* Still queued behind a busy slot: retry the send. */
+    if (!p->sent) {
+        const char *stmt = stmt_for_route(p->route);
+        const char *par[2] = { p->p0, p->p1 };
+        int rc = pg_send_async(p->slot, stmt, p->npar, p->npar ? par : NULL);
+        int fd = pg_socket(p->slot);
+        if (fd < 0 || rc == PG_ASYNC_ERR) {
+            return resume_blocking(c, &tmp);
+        }
+        if (rc == PG_ASYNC_BUSY) return HTTP_DEFERRED;
+        p->sent = 1;
+    }
+    PGresult *res = NULL;
+    int pr = pg_poll(p->slot, &res);
+    if (pr == PG_POLL_PENDING) return HTTP_DEFERRED;
+    if (pr == PG_POLL_ERROR) {
+        if (res) PQclear(res);
+        return resume_blocking(c, &tmp);
+    }
+    /* READY: render from the async result with identical wire semantics. */
+    int ka = 1;
+    if (p->route == PG_ROUTE_HEALTH) {
+        char err[512]; err[0] = '\0';
+        char body[1024];
+        size_t bl;
+        if (pg_render_health(res, err, sizeof err) == 0) {
+            bl = json_render_health(body, sizeof body, p->uptime_s);
+            send_resp(c, &tmp, 200, "OK", body, bl, 0);
+        } else {
+            static const char degraded[] = "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"db unreachable\"}";
+            if (!err[0]) snprintf(err, sizeof err, "db unreachable");
+            fprintf(stderr, "health degraded: %s\n", err);
+            send_resp(c, &tmp, 503, "Service Unavailable", degraded, sizeof degraded - 1, 0);
+        }
+        ka = c->keep_alive;
+    } else if (p->route == PG_ROUTE_FEED) {
+        const char *body = NULL;
+        size_t bl = 0;
+        char err[512];
+        if (pg_render_feed(res, &body, &bl, err, sizeof err) == 0) {
+            send_resp_ex(c, &tmp, 200, "OK", body, bl, 0, 1);
+        } else {
+            send_resp(c, &tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else if (p->route == PG_ROUTE_POST) {
+        const char *body = NULL;
+        size_t bl = 0;
+        char err[512];
+        int r = pg_render_post(res, &body, &bl, err, sizeof err);
+        if (r == 0) {
+            send_resp_ex(c, &tmp, 200, "OK", body, bl, 0, bl >= GZIP_MIN_POST);
+        } else if (r == -2) {
+            send_resp(c, &tmp, 404, "Not Found", JERR_POST_NOT_FOUND, strlen(JERR_POST_NOT_FOUND), 0);
+        } else {
+            send_resp(c, &tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else if (p->route == PG_ROUTE_MKPOST) {
+        const char *body = NULL;
+        size_t bl = 0;
+        char err[512];
+        if (pg_render_mkpost(res, p->p1 ? p->p1 : "", p->body_len,
+                             p->author ? p->author : "", &body, &bl, err, sizeof err) == 0) {
+            send_resp(c, &tmp, 201, "Created", body, bl, 0);
+        } else {
+            send_resp(c, &tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else if (p->route == PG_ROUTE_LIKE) {
+        int already = 0;
+        char err[512];
+        int r = pg_render_like(res, &already, err, sizeof err);
+        if (r == 0) {
+            char lb[96];
+            int n = snprintf(lb, sizeof lb,
+                "{\"liked\":true,\"already_liked\":%s,\"post_id\":%llu}",
+                already ? "true" : "false", p->idv);
+            if (n < 0 || (size_t)n >= sizeof lb) {
+                send_resp(c, &tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+            } else {
+                send_resp(c, &tmp, already ? 200 : 201, already ? "OK" : "Created", lb, (size_t)n, 0);
+            }
+        } else if (r == -2) {
+            send_resp(c, &tmp, 404, "Not Found", JERR_POST_NOT_FOUND, strlen(JERR_POST_NOT_FOUND), 0);
+        } else {
+            send_resp(c, &tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
+        }
+        ka = c->keep_alive;
+    } else {
+        send_resp(c, &tmp, 404, "Not Found", JERR_NOT_FOUND, strlen(JERR_NOT_FOUND), 0);
+        ka = c->keep_alive;
+    }
+    if (res) PQclear(res);
+    http_pending_free(&c->cold->pend);
+    c->state = CONN_ACTIVE;
+    return ka;
 }

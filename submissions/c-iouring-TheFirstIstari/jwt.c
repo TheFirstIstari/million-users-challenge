@@ -7,41 +7,69 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef likely
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
+/* 1s-tick-cached wall clock owned by the worker loop (net.c). */
+time_t net_now_wall(void);
+
 static _Thread_local const char *t_sec = 0;
 static _Thread_local size_t t_seclen = 0;
 
-static int b64v(char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '-') return 62;
-    if (c == '_') return 63;
-    return -1;
-}
+/* Pass 9: 256-entry reverse table (single lookup per char, no branches).
+ * '=' stays -1: padding is rejected exactly as before. Fully explicit to
+ * keep -Woverride-init silent. */
+static const signed char B64V[256] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, 63,
+    -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+};
 
-/* base64url without padding. 0 ok, -1 invalid (bad chars, bad padding). */
+/* base64url without padding. 0 ok, -1 invalid (bad chars, bad padding).
+ * Single pass: each char is looked up exactly once (the old code looked
+ * every char up twice: once to validate, once to decode). */
 static int b64url_dec(const char *s, size_t n, unsigned char *out, size_t cap, size_t *olen) {
     if (n % 4 == 1) return -1;
-    for (size_t i = 0; i < n; i++) {
-        if (s[i] == '=' || b64v(s[i]) < 0) return -1;
-    }
     size_t o = 0;
     size_t full = n / 4, rem = n % 4;
     for (size_t g = 0; g < full; g++) {
-        int a = b64v(s[g * 4]), b = b64v(s[g * 4 + 1]);
-        int c2 = b64v(s[g * 4 + 2]), d = b64v(s[g * 4 + 3]);
-        if (o + 3 > cap) return -1;
+        int a = B64V[(unsigned char)s[g * 4]];
+        int b = B64V[(unsigned char)s[g * 4 + 1]];
+        int c2 = B64V[(unsigned char)s[g * 4 + 2]];
+        int d = B64V[(unsigned char)s[g * 4 + 3]];
+        if (unlikely(a < 0 || b < 0 || c2 < 0 || d < 0)) return -1;
+        if (unlikely(o + 3 > cap)) return -1;
         out[o++] = (unsigned char)((a << 2) | (b >> 4));
         out[o++] = (unsigned char)(((b & 15) << 4) | (c2 >> 2));
         out[o++] = (unsigned char)(((c2 & 3) << 6) | d);
     }
     if (rem == 2) {
-        int a = b64v(s[full * 4]), b = b64v(s[full * 4 + 1]);
-        if (o + 1 > cap) return -1;
+        int a = B64V[(unsigned char)s[full * 4]];
+        int b = B64V[(unsigned char)s[full * 4 + 1]];
+        if (unlikely(a < 0 || b < 0)) return -1;
+        if (unlikely(o + 1 > cap)) return -1;
         out[o++] = (unsigned char)((a << 2) | (b >> 4));
     } else if (rem == 3) {
-        int a = b64v(s[full * 4]), b = b64v(s[full * 4 + 1]), c2 = b64v(s[full * 4 + 2]);
-        if (o + 2 > cap) return -1;
+        int a = B64V[(unsigned char)s[full * 4]];
+        int b = B64V[(unsigned char)s[full * 4 + 1]];
+        int c2 = B64V[(unsigned char)s[full * 4 + 2]];
+        if (unlikely(a < 0 || b < 0 || c2 < 0)) return -1;
+        if (unlikely(o + 2 > cap)) return -1;
         out[o++] = (unsigned char)((a << 2) | (b >> 4));
         out[o++] = (unsigned char)(((b & 15) << 4) | (c2 >> 2));
     }
@@ -122,11 +150,12 @@ int jwt_verify(const char *tok, size_t tlen, const char *secret,
     if (json_scan_string((const char *)pbuf, plen2, "username", user_out, user_cap) != 0)
         return JWT_PAYLOAD;
 
-    /* exp must be a JSON number greater than now; iat ignored. */
+    /* exp must be a JSON number greater than now; iat ignored.
+     * Pass 9: 1s-tick-cached wall clock (1s granularity is fine for exp). */
     long long exp = 0;
     if (json_scan_number((const char *)pbuf, plen2, "exp", &exp) != 0)
         return JWT_BAD;
-    if (exp <= (long long)time(NULL)) return JWT_BAD;
+    if (exp <= (long long)net_now_wall()) return JWT_BAD;
 
     {
         size_t c = sn < sub_cap - 1 ? sn : sub_cap - 1;

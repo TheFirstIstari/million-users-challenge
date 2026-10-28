@@ -28,6 +28,12 @@ $(TARGET): $(OBJS) $(LIBDEFLATE_A)
 $(LIBDEFLATE_A):
 	bash ./build-vendor.sh
 
+# CI fresh-clone race: with `make -j`, %.o compiles (needs
+# -Ivendor/libdeflate-*/libdeflate.h) in parallel with the vendor extract
+# above. Serialize objects after the vendored static lib so a fresh clone
+# (tarball only, no extracted dir) builds the headers first.
+$(OBJS): $(LIBDEFLATE_A)
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 

@@ -12,8 +12,7 @@ set -euo pipefail
 # Elixir < 1.17, overlay pinned prebuilt Elixir from GitHub (reliable host).
 ELIXIR_FALLBACK_VSN="1.19.5"
 ELIXIR_FALLBACK_URL="https://github.com/elixir-lang/elixir/releases/download/v${ELIXIR_FALLBACK_VSN}/elixir-otp-27.zip"
-RABBITMQ_KEY_FP="0A9AF2115F4687FAB565C3C69D8FB2D907BEE6CE"
-RABBITMQ_KEY_URL="https://keys.openpgp.org/vks/v1/by-fingerprint/${RABBITMQ_KEY_FP}"
+RABBITMQ_KEY_URL="https://github.com/rabbitmq/signing-keys/releases/download/3.0/rabbitmq-release-signing-key.asc"
 RABBITMQ_KEYRING="/usr/share/keyrings/com.rabbitmq.team.gpg"
 RABBITMQ_LIST="/etc/apt/sources.list.d/rabbitmq-erlang.list"
 RABBITMQ_ENTRY="deb [signed-by=${RABBITMQ_KEYRING}] https://ppa.launchpadcontent.net/rabbitmq/rabbitmq-erlang/ubuntu noble main"
@@ -34,7 +33,7 @@ elif command -v apt-get >/dev/null 2>&1; then
       { [ "$attempt" -lt 3 ] && sleep $((5 * attempt)); } || true
     done
     if [ ! -s "$RABBITMQ_KEYRING" ]; then
-      echo "FATAL: could not import RabbitMQ team OpenPGP key ${RABBITMQ_KEY_FP} from ${RABBITMQ_KEY_URL}" >&2
+      echo "FATAL: could not import RabbitMQ release signing key from ${RABBITMQ_KEY_URL}" >&2
       exit 1
     fi
   fi

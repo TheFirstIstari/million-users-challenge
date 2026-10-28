@@ -21,6 +21,7 @@ if command -v pacman >/dev/null 2>&1; then
   pacman -S --noconfirm erlang elixir base-devel 2>&1 | tail -2 || true
 elif command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
+  apt-get update || apt-get update
   apt-get install -y curl gnupg apt-transport-https ca-certificates wget unzip 2>&1 | tail -2 || true
   if [ ! -s "$RABBITMQ_KEYRING" ]; then
     for attempt in 1 2 3; do

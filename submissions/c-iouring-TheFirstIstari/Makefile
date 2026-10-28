@@ -1,9 +1,13 @@
 CC=gcc
+# Pass 15: gzip via vendored libdeflate (static). No system zlib (-lz) anymore.
+LIBDEFLATE_VER=1.26
+LIBDEFLATE_DIR=vendor/libdeflate-$(LIBDEFLATE_VER)
+LIBDEFLATE_A=$(LIBDEFLATE_DIR)/libdeflate.a
 # -march=x86-64-v3 (AVX/AVX2/BMI/FMA): valid on the Ryzen build host and on the
 # Xeon 8260-class bench box (Cascade Lake, Haswell+ ISA). Falls back to generic
 # -O3 only if a future bench CPU predates it (it does not).
-CFLAGS=-O3 -march=x86-64-v3 -flto -Wall -Wextra -D_GNU_SOURCE
-LDLIBS=-luring -lpq -lcrypto -lz
+CFLAGS=-O3 -march=x86-64-v3 -flto -Wall -Wextra -D_GNU_SOURCE -I$(LIBDEFLATE_DIR)
+LDLIBS=-luring -lpq -lcrypto
 TARGET=server
 SRCS=server.c net.c http.c pg.c json.c jwt.c
 OBJS=server.o net.o http.o pg.o json.o jwt.o
@@ -11,8 +15,13 @@ NPROC := $(shell nproc 2>/dev/null || echo 16)
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+$(TARGET): $(OBJS) $(LIBDEFLATE_A)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBDEFLATE_A) $(LDLIBS)
+
+# Vendor the static lib on demand (fetch + sha256 verify + extract + build);
+# a no-op when libdeflate.a already exists. `make clean` keeps vendor/.
+$(LIBDEFLATE_A):
+	bash ./build-vendor.sh
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

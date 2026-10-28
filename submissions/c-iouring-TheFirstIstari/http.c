@@ -11,7 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
-#include <zlib.h>
+#include <libdeflate.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -328,40 +328,34 @@ static char *append_u64(char *p, size_t v) {
     return p;
 }
 
-/* ---- Pass 7: feed-first gzip (level 1, gzip framing) ---- */
+/* ---- Pass 7: feed-first gzip (level 1, gzip framing);
+ * Pass 15: vendored libdeflate L1 replaces system zlib. ---- */
 
 #define GZIP_MIN_POST 1024
-/* Worst-case input is t_feed (128 KiB); deflate output can exceed input
- * slightly on incompressible data, so keep 136 KiB of thread-local room. */
+/* Worst-case input is t_feed (128 KiB); keep 136 KiB of thread-local room.
+ * libdeflate_gzip_compress() returns 0 when the output does not fit, and the
+ * worst-case gzip expansion of 128 KiB stays well under GZ_CAP, so any 0
+ * falls through to identity in the caller. */
 #define GZ_CAP 139264
 
-static _Thread_local z_stream t_zs;
-static _Thread_local int t_zs_init = 0;
+static _Thread_local struct libdeflate_compressor *t_ldc = NULL;
 static _Thread_local unsigned char t_gz[GZ_CAP];
 
 /* Compress in[0..ilen) into thread-local t_gz. 0 ok (out+olen set), -1 on
- * failure (caller falls back to identity, byte-exact). No malloc. */
+ * failure (caller falls back to identity, byte-exact). No per-request malloc:
+ * one level-1 compressor per thread, allocated once and reused. */
 static int gzip_compress(const char *in, size_t ilen,
                          const unsigned char **out, size_t *olen) {
-    if (!t_zs_init) {
-        memset(&t_zs, 0, sizeof t_zs);
-        if (deflateInit2(&t_zs, Z_BEST_SPEED, Z_DEFLATED,
-                         15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
-            return -1;
-        t_zs_init = 1;
-    } else {
-        if (deflateReset(&t_zs) != Z_OK)
+    if (unlikely(t_ldc == NULL)) {
+        t_ldc = libdeflate_alloc_compressor(1);
+        if (t_ldc == NULL)
             return -1;
     }
-    t_zs.next_in = (Bytef *)in;
-    t_zs.avail_in = (uInt)ilen;
-    t_zs.next_out = t_gz;
-    t_zs.avail_out = (uInt)sizeof t_gz;
-    int rc = deflate(&t_zs, Z_FINISH);
-    if (rc != Z_STREAM_END)
+    size_t n = libdeflate_gzip_compress(t_ldc, in, ilen, t_gz, sizeof t_gz);
+    if (n == 0)
         return -1;
     *out = t_gz;
-    *olen = sizeof t_gz - t_zs.avail_out;
+    *olen = n;
     return 0;
 }
 

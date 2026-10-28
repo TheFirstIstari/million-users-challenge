@@ -17,7 +17,7 @@ close guards, per-slot waiter counts, 50 k saturation). `test/test.sh` is
 | Async I/O | `liburing 2.15-1.1` | `liburing-dev` |
 | Postgres driver | libpq from `postgresql-libs 18.6-4.1` | `libpq-dev` |
 | Crypto (HMAC-SHA256) | `openssl 3.6.4-1.1` | `libssl-dev` |
-| gzip (level 1, feed-first) | `zlib` (`zlib-ng-compat 2.3.3-2`) | `zlib1g-dev` |
+| gzip (level 1, feed-first) | vendored `libdeflate 1.26` (static, `vendor/`) | none (vendored) |
 | Database | `postgres:18` (see `test/run.sh`) | — |
 
 Build flags (`Makefile`): `-O3 -march=x86-64-v3 -flto -Wall -Wextra
@@ -147,21 +147,25 @@ Routes (`http.c`): `GET /health`, `GET /feed`, `GET /posts/<id>`,
   `conn_cold.wbuf/wlen/woff` and re-arms `EPOLLOUT` — no response is ever
   dropped on a full socket.
 
-## Gzip (Pass 7: feed-first, level 1, 4×)
+## Gzip (Pass 7: feed-first, level 1, ≥1024 B; Pass 15: libdeflate)
 
 `GET /feed` is compressed whenever the client sends `Accept-Encoding: gzip`
-(measured **3602 → 908 B, ~4×** on the reference feed); `GET /posts/<id>` is
-compressed when asked **and** the body is ≥ 1024 bytes (`GZIP_MIN_POST`).
-Everything else (health, errors, `POST /posts`, likes, small posts) stays
-`identity`. Responses carry `Content-Encoding: gzip` plus the compressed
-`Content-Length`; clients without `Accept-Encoding` get byte-exact identity
-JSON (golden files unchanged). Any compression failure falls through to
-identity.
+(measured **5303 → 1832 B, ~2.9×** with libdeflate
+level 1 on the reference feed); `GET /posts/<id>` is compressed when asked
+**and** the body is ≥ 1024 bytes (`GZIP_MIN_POST`). Everything else (health,
+errors, `POST /posts`, likes, small posts) stays `identity`. Responses carry
+`Content-Encoding: gzip` plus the compressed `Content-Length`; clients without
+`Accept-Encoding` get byte-exact identity JSON (golden files unchanged). Any
+compression failure falls through to identity.
 
-Compression reuses one per-thread `z_stream` (`Z_BEST_SPEED`, gzip framing)
-and a 136 KiB thread-local output buffer (`GZ_CAP 139264`) — no per-request
-malloc, and the render buffers (`t_feed` 128 KiB, `t_post` 8 KiB) are gzipped
-after rendering, before the single `sendmsg`.
+Compression reuses one per-thread libdeflate level-1 compressor
+(`libdeflate_alloc_compressor(1)`, gzip framing via
+`libdeflate_gzip_compress()`) and a 136 KiB thread-local output buffer
+(`GZ_CAP 139264`) — no per-request malloc, and the render buffers (`t_feed`
+128 KiB, `t_post` 8 KiB) are gzipped after rendering, before the single
+`sendmsg`. libdeflate 1.26 is vendored (`vendor/libdeflate-1.26.tar.gz`,
+SHA256-pinned, static `libdeflate.a` built by `build-vendor.sh`); no system
+zlib is needed (`-lz` removed from the link).
 
 ## Auth: JWT verified on every request, nothing cached
 
@@ -257,7 +261,7 @@ FDs track **users + 579** (listeners, epoll, rings, 512 PG conns, stdio).
 | Idle / header timeouts | 80 s / 20 s, 1 s wheel sweep, 128 slots | `net.c` | slow-loris resistance, O(expired) reap |
 | Requests per conn | ~1000 then close | `net.c`/`http.c` | bound per-conn state lifetime |
 | PG reconnect | reconnect-once + inline non-prepared retry | `pg.c` | survive restarts without dropping |
-| Gzip | `Z_BEST_SPEED`, feed-first, ≥ 1024 B post threshold | `http.c` | 4× feed saving, no small-body tax |
+| Gzip | libdeflate L1, feed-first, ≥ 1024 B post threshold | `http.c` | ~2.9× feed saving, no small-body tax |
 
 ## Validation results (last measured, Passes 6–14)
 
@@ -296,14 +300,18 @@ renderers) · `jwt.c`/`jwt.h` (HS256 verify, every request) ·
 
 - `install.sh`: root-aware (`sudo` only when non-root and present, never reads
   passwords), pinned on CachyOS/Arch (`liburing=2.15-1.1`,
-  `postgresql-libs=18.6-4.1`, `openssl=3.6.4-1.1`, `zlib`) with latest-fallback,
-  Ubuntu 24.04 equivalents (`build-essential liburing-dev libpq-dev libssl-dev
-  zlib1g-dev`).
+  `postgresql-libs=18.6-4.1`, `openssl=3.6.4-1.1`) with latest-fallback,
+  Ubuntu 24.04 equivalents (`build-essential liburing-dev libpq-dev libssl-dev`),
+  plus `curl`/`tar` to fetch the pinned libdeflate tarball (no system zlib:
+  gzip is vendored, see `build-vendor.sh`).
+- `build-vendor.sh`: verifies the `libdeflate 1.26` tarball SHA256, extracts
+  to `vendor/`, and builds the static `libdeflate.a` (no system install);
+  invoked automatically by the Makefile, `fetch`-only mode from `install.sh`.
 - `build.sh`: `make -j$(nproc)` from the submission dir.
 - `start.sh`: foreground `exec ./server`, env-only, `ulimit -n 1048576 ||
   true` + `MALLOC_ARENA_MAX=2`.
 - `pgo-profile.sh`: scratch-DB 5 k `mload` profile driver (not CI).
-- All `*.sh` are executable; `.gitignore` covers `server *.o *.gcda *.gcno`.
+- All `*.sh` are executable; `.gitignore` covers `server *.o *.gcda *.gcno *.a` plus `vendor/*` (except the pinned `*.tar.gz`).
 
 ## CI and PR status
 

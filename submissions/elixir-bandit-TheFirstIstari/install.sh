@@ -8,39 +8,18 @@ set -euo pipefail
 #   Erlang Solutions host persistently 502s, removed). The PPA provides OTP 27/28
 #   and the archive Elixir dependency resolves to PPA Erlang.
 # App deps pinned via mix.lock (bandit 1.14, plug 1.20, postgrex 0.22, jason 1.4).
-# RabbitMQ key import retries 3x; apt-get update retries 1x. On OTP >= 27 but
+# PPA via add-apt-repository (handles Launchpad key); apt-get update retries 1x. On OTP >= 27 but
 # Elixir < 1.17, overlay pinned prebuilt Elixir from GitHub (reliable host).
 ELIXIR_FALLBACK_VSN="1.19.5"
 ELIXIR_FALLBACK_URL="https://github.com/elixir-lang/elixir/releases/download/v${ELIXIR_FALLBACK_VSN}/elixir-otp-27.zip"
-RABBITMQ_KEY_URL="https://github.com/rabbitmq/signing-keys/releases/download/3.0/rabbitmq-release-signing-key.asc"
-RABBITMQ_KEYRING="/usr/share/keyrings/com.rabbitmq.team.gpg"
-RABBITMQ_LIST="/etc/apt/sources.list.d/rabbitmq-erlang.list"
-RABBITMQ_ENTRY="deb [signed-by=${RABBITMQ_KEYRING}] https://ppa.launchpadcontent.net/rabbitmq/rabbitmq-erlang/ubuntu noble main"
 if command -v pacman >/dev/null 2>&1; then
   pacman -Sy --noconfirm 2>&1 | tail -1 || true
   pacman -S --noconfirm erlang elixir base-devel 2>&1 | tail -2 || true
 elif command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update || apt-get update
-  apt-get install -y curl gnupg apt-transport-https ca-certificates wget unzip 2>&1 | tail -2 || true
-  if [ ! -s "$RABBITMQ_KEYRING" ]; then
-    for attempt in 1 2 3; do
-      rm -f "$RABBITMQ_KEYRING"
-      if curl -fsSL --max-time 30 "$RABBITMQ_KEY_URL" | gpg --yes --dearmor -o "$RABBITMQ_KEYRING" && [ -s "$RABBITMQ_KEYRING" ]; then
-        break
-      fi
-      echo "warning: RabbitMQ key download attempt ${attempt}/3 failed (retrying)" >&2
-      rm -f "$RABBITMQ_KEYRING"
-      { [ "$attempt" -lt 3 ] && sleep $((5 * attempt)); } || true
-    done
-    if [ ! -s "$RABBITMQ_KEYRING" ]; then
-      echo "FATAL: could not import RabbitMQ release signing key from ${RABBITMQ_KEY_URL}" >&2
-      exit 1
-    fi
-  fi
-  if [ ! -f "$RABBITMQ_LIST" ]; then
-    echo "$RABBITMQ_ENTRY" > "$RABBITMQ_LIST"
-  fi
+  apt-get install -y curl gnupg apt-transport-https ca-certificates wget unzip software-properties-common 2>&1 | tail -2 || true
+  add-apt-repository -y ppa:rabbitmq/rabbitmq-erlang || add-apt-repository -y ppa:rabbitmq/rabbitmq-erlang
   apt-get update || apt-get update
   apt-get install -y erlang elixir build-essential 2>&1 | tail -3 || true
   # Apt gate (advisory here; hard gate runs below). If the archive Elixir is

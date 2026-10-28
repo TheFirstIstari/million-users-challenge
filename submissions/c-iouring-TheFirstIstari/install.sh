@@ -9,12 +9,12 @@ if command -v pacman >/dev/null 2>&1; then
   # CachyOS/Arch. Pinned to the validated versions; fall back to latest on drift.
   # Pass 15: gzip is vendored libdeflate (static) — no system zlib needed.
   $SUDO pacman -Sy --noconfirm 2>&1 | tail -2 || true
-  $SUDO pacman -S --noconfirm 'liburing=2.15-1.1' 'postgresql-libs=18.6-4.1' 'openssl=3.6.4-1.1' curl tar 2>&1 | tail -3 \
-    || $SUDO pacman -S --noconfirm gcc liburing postgresql-libs openssl curl tar 2>&1 | tail -3 || true
+  $SUDO pacman -S --noconfirm 'liburing=2.15-1.1' 'postgresql-libs=18.6-4.1' 'openssl=3.6.4-1.1' curl tar pkgconf 2>&1 | tail -3 \
+    || $SUDO pacman -S --noconfirm gcc liburing postgresql-libs openssl curl tar pkgconf 2>&1 | tail -3 || true
 elif command -v apt-get >/dev/null 2>&1; then
   # Ubuntu 24.04 equivalents of the CachyOS pins above.
   $SUDO apt-get update
-  $SUDO apt-get install -y build-essential liburing-dev libpq-dev libssl-dev curl tar ca-certificates
+  $SUDO apt-get install -y build-essential liburing-dev libpq-dev libssl-dev curl tar ca-certificates pkg-config
 else
   echo "no supported package manager (pacman/apt) found" >&2
   exit 1

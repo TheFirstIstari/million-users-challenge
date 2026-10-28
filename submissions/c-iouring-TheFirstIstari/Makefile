@@ -6,8 +6,13 @@ LIBDEFLATE_A=$(LIBDEFLATE_DIR)/libdeflate.a
 # -march=x86-64-v3 (AVX/AVX2/BMI/FMA): valid on the Ryzen build host and on the
 # Xeon 8260-class bench box (Cascade Lake, Haswell+ ISA). Falls back to generic
 # -O3 only if a future bench CPU predates it (it does not).
-CFLAGS=-O3 -march=x86-64-v3 -flto -Wall -Wextra -D_GNU_SOURCE -I$(LIBDEFLATE_DIR)
-LDLIBS=-luring -lpq -lcrypto
+# Portable libpq flags: Ubuntu 24.04 puts libpq-fe.h in /usr/include/postgresql
+# (needs -I/usr/include/postgresql); CachyOS/Arch puts it in /usr/include.
+# pkg-config covers both; the hardcoded fallback covers a missing pkg-config.
+PG_CFLAGS := $(shell pkg-config --cflags libpq 2>/dev/null || echo -I/usr/include/postgresql)
+PG_LDLIBS := $(shell pkg-config --libs libpq 2>/dev/null || echo -lpq)
+CFLAGS=-O3 -march=x86-64-v3 -flto -Wall -Wextra -D_GNU_SOURCE -I$(LIBDEFLATE_DIR) $(PG_CFLAGS)
+LDLIBS=-luring $(PG_LDLIBS) -lcrypto
 TARGET=server
 SRCS=server.c net.c http.c pg.c json.c jwt.c
 OBJS=server.o net.o http.o pg.o json.o jwt.o

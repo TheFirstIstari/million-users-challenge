@@ -9,6 +9,27 @@ defmodule Feed.Router do
     |> Plug.Conn.put_resp_content_type("application/json")
     |> Plug.Conn.send_resp(status, iodata)
   end
+  defp gzip_accepted?(conn) do
+    Enum.any?(Plug.Conn.get_req_header(conn, "accept-encoding"), fn v ->
+      String.contains?(String.downcase(v), "gzip")
+    end)
+  end
+  defp maybe_gzip(conn, status, iodata) do
+    if gzip_accepted?(conn) and :erlang.iolist_size(iodata) >= 1024 do
+      z = :zlib.open()
+      :ok = :zlib.deflateInit(z, 1, :deflated, 31, 8, :default)
+      gz = :zlib.deflate(z, iodata, :finish)
+      :ok = :zlib.deflateEnd(z)
+      :ok = :zlib.close(z)
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.put_resp_header("content-encoding", "gzip")
+      |> Plug.Conn.put_resp_header("vary", "Accept-Encoding")
+      |> Plug.Conn.send_resp(status, :erlang.iolist_to_binary(gz))
+    else
+      send_json(conn, status, iodata)
+    end
+  end
   defp err(conn, status, msg) do
     send_json(conn, status, ["{\"error\":", Feed.Json.esc(msg), "}"])
   end
@@ -48,7 +69,7 @@ defmodule Feed.Router do
     case Feed.DB.feed(20) do
       {:ok, %Postgrex.Result{rows: rows}} ->
         posts = Enum.map(rows, &row_to_iodata/1) |> Enum.intersperse(",")
-        send_json(conn, 200, ["{\"posts\":[", posts, "]}"])
+        maybe_gzip(conn, 200, ["{\"posts\":[", posts, "]}"])
       {:error, _} ->
         err(conn, 500, "internal server error")
     end
@@ -61,7 +82,7 @@ defmodule Feed.Router do
         case Feed.DB.get_post(pid) do
           {:ok, %Postgrex.Result{rows: []}} -> err(conn, 404, "post not found")
           {:ok, %Postgrex.Result{rows: [row]}} ->
-            send_json(conn, 200, ["{\"post\":", row_to_iodata(row), "}"])
+            maybe_gzip(conn, 200, ["{\"post\":", row_to_iodata(row), "}"])
           {:error, _} -> err(conn, 500, "internal server error")
         end
     end

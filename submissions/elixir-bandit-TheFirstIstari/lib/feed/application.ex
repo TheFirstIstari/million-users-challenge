@@ -20,6 +20,8 @@ defmodule Feed.Application do
     reuseport = sockets > 1
     pg_opts = pg_opts(db_url, cores)
     pool_size = Keyword.fetch!(pg_opts, :pool_size)
+    {shards, pg_children} = pg_shards(pg_opts)
+    :persistent_term.put(:feed_pg_shards, shards)
     ip = parse_ip(host)
     Logger.info("[cores] schedulers_online=#{cores} acceptors=#{acceptors} sockets=#{sockets} pool=#{pool_size} reuseport=#{reuseport} num_connections=#{num_connections}")
     bandit_base = [
@@ -31,7 +33,7 @@ defmodule Feed.Application do
         num_listen_sockets: sockets,
         read_timeout: 120_000,
         shutdown_timeout: 5000,
-        transport_options: [reuseport: reuseport, backlog: 4096, recbuf: 4096, sndbuf: 4096, buffer: 4096, keepalive: true]
+        transport_options: [reuseport: reuseport, backlog: 65535, recbuf: 4096, sndbuf: 4096, buffer: 4096, keepalive: true]
       ],
       http_1_options: [
         clear_process_dict: true,
@@ -45,7 +47,7 @@ defmodule Feed.Application do
       startup_log: false
     ]
     children =
-      [{Postgrex, Keyword.put(pg_opts, :name, Feed.PG)}] ++
+      pg_children ++
         [Supervisor.child_spec({Bandit, Keyword.put(bandit_base, :port, port)}, id: :bandit_main)] ++
         (case extra_port do
            nil -> []
@@ -53,7 +55,7 @@ defmodule Feed.Application do
          end)
     opts = [strategy: :one_for_one, name: Feed.Supervisor]
     {:ok, sup} = Supervisor.start_link(children, opts)
-    Logger.info("[pool] size=#{pool_size} prepare=named queue_target=50 queue_interval=1000 timeout=5000")
+    Logger.info("[pool] shards=#{shards} sizes=#{inspect(Enum.map(pg_children, fn {Postgrex, o} -> Keyword.fetch!(o, :pool_size) end))} total=#{pool_size} prepare=named queue_target=50 queue_interval=1000 timeout=5000")
     Logger.info("[http] compress=false")
     warmup()
     {:ok, sup}
@@ -82,6 +84,19 @@ defmodule Feed.Application do
       {:ok, ip} -> ip
       _ -> {0, 0, 0, 0}
     end
+  end
+  defp pg_shards(pg_opts) do
+    total = Keyword.fetch!(pg_opts, :pool_size)
+    s = min(System.schedulers_online(), 8)
+    base = div(total, s)
+    rem = rem(total, s)
+    children =
+      for i <- 1..s do
+        size = if i <= rem, do: base + 1, else: base
+        name = Module.concat(Feed, "PG#{i}")
+        {Postgrex, pg_opts |> Keyword.put(:name, name) |> Keyword.put(:pool_size, size)}
+      end
+    {s, children}
   end
   defp pg_opts(url, cores) do
     uri = URI.parse(url)

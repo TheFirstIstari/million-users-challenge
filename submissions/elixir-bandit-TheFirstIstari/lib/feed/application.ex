@@ -31,7 +31,7 @@ defmodule Feed.Application do
         num_listen_sockets: sockets,
         read_timeout: 120_000,
         shutdown_timeout: 5000,
-        transport_options: [inet_backend: :socket, reuseport: reuseport, backlog: 65535, recbuf: 4096, sndbuf: 4096, buffer: 4096, keepalive: true]
+        transport_options: [reuseport: reuseport, backlog: 4096, recbuf: 4096, sndbuf: 4096, buffer: 4096, keepalive: true]
       ],
       http_1_options: [
         clear_process_dict: true,
@@ -41,6 +41,7 @@ defmodule Feed.Application do
         max_header_count: 25
       ],
       http_options: [compress: false, log_protocol_errors: false, log_client_closures: false],
+      http_2_options: [enabled: false],
       startup_log: false
     ]
     children =

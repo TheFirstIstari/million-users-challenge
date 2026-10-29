@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ulimit -n 1048576 || true
+ulimit -n 1048576 2>/dev/null || true
 cd "$(dirname "$0")"
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export MIX_ENV=prod

@@ -10,6 +10,7 @@ export MIX_ENV=prod
 # changed to +A $CORES in Pass7; 16-core behavior changed 96 -> 16 but re-validated).
 CORES=$(nproc 2>/dev/null || echo 16)
 case "$CORES" in ''|*[!0-9]*) CORES=16 ;; esac
+export ERL_FULLSWEEP_AFTER=0
 export ERL_MAX_PORTS=${ERL_MAX_PORTS:-2097152}
 export ELIXIR_ERL_OPTIONS="+fnu +P 2097152 +Q 2097152 +A $CORES +K true +sbwt none +sbwtdcpu none +sbwtdio none"
 # NOTE: ERL_MEM_TOTAL is not a real OTP var (was a no-op here); memory is bounded

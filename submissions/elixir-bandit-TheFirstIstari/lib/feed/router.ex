@@ -26,7 +26,9 @@ defmodule Feed.Router do
   defp parse_id(_), do: :error
 
   defp row_to_iodata([id, body, created, author, like_count]) do
-    Feed.Json.post_object(id, body, Feed.Json.format_created_at(created), author, like_count)
+    # :binary.copy detaches PG socket recv-buffer sub-binaries so responses
+    # don't retain the driver's large receive buffer.
+    Feed.Json.post_object(id, :binary.copy(body), Feed.Json.format_created_at(created), :binary.copy(author), like_count)
   end
 
   get "/health" do
@@ -86,7 +88,7 @@ defmodule Feed.Router do
                       true ->
                         case Feed.DB.insert_post(uid, trimmed) do
                           {:ok, %Postgrex.Result{rows: [[new_id, created]]}} ->
-                            post = Feed.Json.post_object(new_id, trimmed, Feed.Json.format_created_at(created), uname, 0)
+                            post = Feed.Json.post_object(new_id, :binary.copy(trimmed), Feed.Json.format_created_at(created), :binary.copy(uname), 0)
                             send_json(conn, 201, ["{\"post\":", post, "}"])
                           {:error, _} -> err(conn, 500, "internal server error")
                         end

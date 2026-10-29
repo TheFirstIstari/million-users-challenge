@@ -10,9 +10,14 @@
 #include <time.h>
 
 #define POOL_N 32
+#define POOL_R 24
+#define POOL_W 8
+#define POOL_W_BASE 24
 
 static _Thread_local PGconn *t_pool[POOL_N];
 static _Thread_local unsigned t_rr = 0;
+static _Thread_local unsigned t_rr_r = 0;
+static _Thread_local unsigned t_rr_w = 0;
 static _Thread_local char t_conninfo[2048];
 
 /* Pass 6 async state: one in-flight flag per slot + start stamp for the
@@ -37,6 +42,23 @@ int pg_busy_count(void) {
     return n;
 }
 
+/* Pass 17: per-pool busy counts (R = slots 0..23, W = 24..31). */
+int pg_busy_count_R(void) {
+    int n = 0;
+    for (int i = 0; i < POOL_R; i++) if (t_async_busy[i]) n++;
+    return n;
+}
+
+int pg_busy_count_W(void) {
+    int n = 0;
+    for (int i = POOL_W_BASE; i < POOL_N; i++) if (t_async_busy[i]) n++;
+    return n;
+}
+
+int pg_slot_is_write(int slot) {
+    return slot >= POOL_W_BASE && slot < POOL_N;
+}
+
 /* 1 when libpq still holds unsent bytes for the slot (needs POLLOUT),
  * else 0. Lets net arm EPOLLOUT only while a flush is actually pending;
  * an idle PG socket is always writable, so a standing EPOLLOUT arm would
@@ -52,8 +74,8 @@ static void pg_report_maybe(void) {
     time_t now = net_now_wall();
     if (now - t_last_rep < 60) return;
     t_last_rep = now;
-    fprintf(stderr, "pg stats: ops=%lu slow_gt50ms=%lu reconnects=%lu busy=%d peak=%lu\n",
-            t_qops, t_qslow, t_recon, pg_busy_count(), t_busy_peak);
+    fprintf(stderr, "pg stats: ops=%lu slow_gt50ms=%lu reconnects=%lu busy=%d(R%d/W%d) peak=%lu\n",
+            t_qops, t_qslow, t_recon, pg_busy_count(), pg_busy_count_R(), pg_busy_count_W(), t_busy_peak);
 }
 
 static const char *SQL_HEALTH =
@@ -123,6 +145,21 @@ static void pg_prepare_all(PGconn *c) {
     }
 }
 
+/* Pass 16: per-session planner SETs (session scope only, no SQL/schema
+ * change). Single multi-statement PQexec keeps setup at one round trip.
+ * Covers all setup paths: async connectStart, blocking fallback, and every
+ * reconnect/probe (all funnel through pg_connect_one). */
+static void pg_apply_session_sets(PGconn *c) {
+    PGresult *r = PQexec(c,
+        "SET statement_timeout=5000;"
+        "SET application_name='c-iouring';"
+        "SET plan_cache_mode=force_generic_plan;"
+        "SET jit=off;"
+        "SET max_parallel_workers_per_gather=0;"
+        "SET enable_memoize=off");
+    if (r) PQclear(r);
+}
+
 static PGconn *pg_connect_finish(PGconn *c) {
     /* Drive an async-started connection to completion, SET timeout, prepare.
      * Returns c on success, NULL on failure (already finished). */
@@ -131,10 +168,7 @@ static PGconn *pg_connect_finish(PGconn *c) {
     if (PQsetnonblocking(c, 1) != 0) { PQfinish(c); return NULL; }
     if (wait_conn(c, 5000) != 0) { PQfinish(c); return NULL; }
     if (PQstatus(c) != CONNECTION_OK) { PQfinish(c); return NULL; }
-    {
-        PGresult *r = PQexec(c, "SET statement_timeout=5000");
-        if (r) PQclear(r);
-    }
+    pg_apply_session_sets(c);
     pg_prepare_all(c);
     return c;
 }
@@ -155,8 +189,7 @@ static PGconn *pg_connect_one(void) {
         PGconn *c = PQconnectdb(t_conninfo);
         if (c && PQstatus(c) == CONNECTION_OK) {
             if (PQsetnonblocking(c, 1) != 0) { PQfinish(c); return NULL; }
-            PGresult *r = PQexec(c, "SET statement_timeout=5000;SET application_name='c-iouring'");
-            if (r) PQclear(r);
+            pg_apply_session_sets(c);
             pg_prepare_all(c);
             return c;
         }
@@ -180,7 +213,7 @@ void pg_init_thread(const char *conninfo) {
         t_async_sampled[i] = 0;
     }
     t_busy_peak = 0;
-    fprintf(stderr, "pg pool: %d/%d conns ok\n", ok, POOL_N);
+    fprintf(stderr, "pg pool: %d/%d conns ok (24R+8W split)\n", ok, POOL_N);
 }
 
 int pg_claim_slot(void) {
@@ -189,11 +222,50 @@ int pg_claim_slot(void) {
     return s;
 }
 
+/* Pass 17: pool-aware claims. R and W have independent round-robins so a
+ * read burst cannot starve writes and vice versa. */
+int pg_claim_slot_R(void) {
+    int s = (int)(t_rr_r % POOL_R);
+    t_rr_r++;
+    return s;
+}
+
+int pg_claim_slot_W(void) {
+    int s = POOL_W_BASE + (int)(t_rr_w % POOL_W);
+    t_rr_w++;
+    return s;
+}
+
+/* MKPOST(4)/LIKE(5) -> W pool, everything else -> R pool. Constants mirror
+ * PG_ROUTE_MKPOST/PG_ROUTE_LIKE in net.h without a hard dependency. */
+int pg_claim_slot_for_route(int route) {
+    if (route == 4 || route == 5) return pg_claim_slot_W();
+    return pg_claim_slot_R();
+}
+
 /* Sync-path slot: skip async-busy slots to preserve single in-flight per
  * conn. Returns -1 when every slot is async-busy (caller fails over). */
 static int pg_slot_sync(void) {
     for (int i = 0; i < POOL_N; i++) {
         int s = pg_claim_slot();
+        if (!t_async_busy[s]) return s;
+    }
+    return -1;
+}
+
+/* Pass 17: pool-scoped sync slots. Blocking fallbacks stay in their route
+ * pool so a busy R pool never borrows (and blocks) a W conn. */
+static int pg_slot_sync_R(void) {
+    for (int i = 0; i < POOL_R; i++) {
+        int s = pg_claim_slot_R();
+        if (!t_async_busy[s]) return s;
+    }
+    return -1;
+}
+
+static int pg_slot_sync_W(void) {
+    for (int i = 0; i < POOL_W; i++) {
+        int s = pg_claim_slot_W();
         if (!t_async_busy[s]) return s;
     }
     return -1;
@@ -757,7 +829,8 @@ int pg_render_like(PGresult *r, int *already, char *errbuf, size_t errcap) {
 }
 
 int pg_health_check(char *errbuf, unsigned long errcap) {
-    int slot = pg_slot_sync();
+    int slot = pg_slot_sync_R();
+    if (slot < 0) slot = pg_slot_sync();
     if (slot < 0) {
         if (errbuf && errcap) snprintf(errbuf, errcap, "db unreachable");
         return -1;
@@ -777,7 +850,8 @@ int pg_health_check(char *errbuf, unsigned long errcap) {
 }
 
 int pg_feed(const char **out, size_t *len, char *errbuf, size_t errcap) {
-    int slot = pg_slot_sync();
+    int slot = pg_slot_sync_R();
+    if (slot < 0) slot = pg_slot_sync();
     if (slot < 0) {
         if (errbuf && errcap) snprintf(errbuf, errcap, "db unreachable");
         return -1;
@@ -794,7 +868,8 @@ int pg_feed(const char **out, size_t *len, char *errbuf, size_t errcap) {
 
 int pg_get_post(const char *idstr, const char **out, size_t *len, char *errbuf, size_t errcap) {
     const char *par[1] = { idstr };
-    int slot = pg_slot_sync();
+    int slot = pg_slot_sync_R();
+    if (slot < 0) slot = pg_slot_sync();
     if (slot < 0) {
         if (errbuf && errcap) snprintf(errbuf, errcap, "db unreachable");
         return -1;
@@ -817,7 +892,8 @@ int pg_create_post(const char *uid, const char *body, size_t body_n, const char 
     memcpy(t_body, body, bn);
     t_body[bn] = '\0';
     const char *par[2] = { uid, t_body };
-    int slot = pg_slot_sync();
+    int slot = pg_slot_sync_W();
+    if (slot < 0) slot = pg_slot_sync();
     if (slot < 0) {
         if (errbuf && errcap) snprintf(errbuf, errcap, "db unreachable");
         return -1;
@@ -834,7 +910,8 @@ int pg_create_post(const char *uid, const char *body, size_t body_n, const char 
 
 int pg_like(const char *uid, const char *pid, int *already, char *errbuf, size_t errcap) {
     const char *par[2] = { uid, pid };
-    int slot = pg_slot_sync();
+    int slot = pg_slot_sync_W();
+    if (slot < 0) slot = pg_slot_sync();
     if (slot < 0) {
         if (errbuf && errcap) snprintf(errbuf, errcap, "db unreachable");
         return -1;

@@ -27,6 +27,16 @@
 #define HDR_TIMEOUT_S 20
 #define MAX_CONNS_PER_WORKER 64000
 #define PG_NSLOTS 32
+#define PG_R_NSLOTS 24 /* Pass 17: slots 0..23 = R, 24..31 = W */
+
+/* Pass 16b: tuned light-batch coalesce. Sleep only after COAL_K
+ * consecutive light batches (0<n<COAL_N), 500us (not 2ms), then the
+ * next epoll_wait uses timeout 0 to redrain the slept window into a
+ * bigger batch. Busy (n>=COAL_N) or idle (n==0) resets the streak and
+ * never sleeps. Refs rival #10/#11/#30. */
+#define COAL_N 32
+#define COAL_K 3
+#define COAL_NS 500000L
 
 /* Pass 10: share-nothing per-thread state in one 64B-aligned block.
  * Groups the old scattered thread-locals plus the new slab freelists and
@@ -296,6 +306,114 @@ static void conn_free(struct conn_hot *c, int epfd) {
 #define TAG_L2 ((void *)(intptr_t)-2)
 #define TAG_URING ((void *)(intptr_t)-3)
 
+/* ---- Pass 18: provided-buffer recv (pbuf ring) ----
+ * Per-thread ring of 1024 x 2KB buffers (fixed 2MB, 64B-aligned, allocated
+ * once at worker startup so it sits in baseline RSS, outside per-conn idle
+ * math). The epoll data path recvs into the next ring slot and parses in
+ * place (pico, zero-copy); the slot is "returned" by cursor advance at
+ * handler return -- nothing is retained (http_defer dups every stashed
+ * field). Only partial (need-more) or pipelined requests are boxed into the
+ * size-class slab (existing slow path, unchanged).
+ * The ring is also provided to the io_uring instance (PROVIDE_BUFFERS,
+ * bgid 1) so a future pass can submit buffer-select multishot recvs without
+ * re-wiring; recv-multishot support is probed at startup and logged, while
+ * the data path stays on the epoll fallback (per-conn multishot lifecycle --
+ * cancel-on-close, PG_WAIT stash, pipelining order -- needs its own pass;
+ * dual-arming it here would risk use-after-free via CQE data). */
+#define PBUF_N 1024
+#define PBUF_SZ 2048
+#define PBUF_BGID 1
+#define PBUF_PROVIDE_TAG (-1)
+
+static _Thread_local char *t_pbuf_base = NULL;
+static _Thread_local unsigned t_pbuf_cur = 0;
+static _Thread_local char t_recv_probe_buf[2048];
+
+static int pbuf_init(void) {
+    if (t_pbuf_base) return 0;
+    void *p = NULL;
+    if (posix_memalign(&p, 64, (size_t)PBUF_N * PBUF_SZ) != 0) return -1;
+    t_pbuf_base = (char *)p;
+    t_pbuf_cur = 0;
+    return 0;
+}
+
+static inline char *pbuf_next(void) {
+    if (!t_pbuf_base && pbuf_init() != 0) return NULL;
+    char *b = t_pbuf_base + (size_t)t_pbuf_cur * PBUF_SZ;
+    t_pbuf_cur++;
+    if (t_pbuf_cur >= PBUF_N) t_pbuf_cur = 0;
+    return b;
+}
+
+/* Register the whole ring with the uring instance (one PROVIDE_BUFFERS SQE,
+ * PBUF_N buffers of PBUF_SZ from bid 0). The provide CQE (data64 = -1) is
+ * soaked by the caller via uring_drain, which skips that tag. */
+static int pbuf_provide(struct io_uring *ring) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        if (io_uring_submit(ring) < 0) return -1;
+        sqe = io_uring_get_sqe(ring);
+        if (!sqe) return -1;
+    }
+    io_uring_prep_provide_buffers(sqe, t_pbuf_base, PBUF_SZ, PBUF_N, PBUF_BGID, 0);
+    io_uring_sqe_set_data64(sqe, (unsigned long long)(long)PBUF_PROVIDE_TAG);
+    return io_uring_submit(ring) >= 0 ? 0 : -1;
+}
+
+/* Probe IORING_OP_RECV_MULTISHOT + IOSQE_BUFFER_SELECT on a throwaway
+ * socketpair (same pattern as the multishot-accept probe). 1 when a
+ * buffer-select multishot recv arms on this kernel, 0 otherwise. */
+static int uring_recv_mshot_probe(void) {
+    int sv[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sv) != 0)
+        return 0;
+    int supported = 0;
+    struct io_uring pring;
+    struct io_uring_params pp;
+    memset(&pp, 0, sizeof pp);
+    pp.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
+    if (io_uring_queue_init_params(8, &pring, &pp) == 0) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&pring);
+        if (sqe) {
+            io_uring_prep_provide_buffers(sqe, t_recv_probe_buf, sizeof t_recv_probe_buf, 1, 77, 0);
+            io_uring_sqe_set_data64(sqe, 0x50524244ull); /* 'PRBD' */
+            if (io_uring_submit(&pring) == 1) {
+                struct io_uring_cqe *cqe = NULL;
+                struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
+                if (io_uring_wait_cqe_timeout(&pring, &cqe, &ts) == 0 && cqe) {
+                    int ok = (cqe->res == 0);
+                    io_uring_cqe_seen(&pring, cqe);
+                    if (ok) {
+                        sqe = io_uring_get_sqe(&pring);
+                        if (sqe) {
+                            io_uring_prep_recv_multishot(sqe, sv[0], NULL, 2048, 0);
+                            sqe->flags |= IOSQE_BUFFER_SELECT;
+                            sqe->buf_group = 77;
+                            io_uring_sqe_set_data64(sqe, 0x52564356ull); /* 'RVCV' */
+                            if (io_uring_submit(&pring) == 1) {
+                                (void)!write(sv[1], "x", 1);
+                                struct __kernel_timespec ts2 = { .tv_sec = 0, .tv_nsec = 300 * 1000 * 1000 };
+                                if (io_uring_wait_cqe_timeout(&pring, &cqe, &ts2) == 0 && cqe) {
+                                    if (cqe->res > 0) supported = 1;
+                                    else if (cqe->res < 0 && cqe->res != -EINVAL) supported = 1;
+                                    io_uring_cqe_seen(&pring, cqe);
+                                } else {
+                                    supported = 1; /* still pending: multishot armed */
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        io_uring_queue_exit(&pring);
+    }
+    if (sv[0] >= 0) close(sv[0]);
+    if (sv[1] >= 0) close(sv[1]);
+    return supported;
+}
+
 static void conn_register(int epfd, int afd, time_t now) {
     int one = 1;
     setsockopt(afd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -395,6 +513,7 @@ static void uring_drain(struct io_uring *ring, int epfd,
         int res = cqe->res;
         unsigned flags = cqe->flags;
         io_uring_cqe_seen(ring, cqe);
+        if (lfd == PBUF_PROVIDE_TAG) continue; /* Pass 18: provide-buffers CQE, no conn */
         if (res >= 0) {
             conn_register(epfd, res, now);
             *einval = 0;
@@ -519,10 +638,85 @@ static int drain_pending(struct conn_hot *c) {
     return 0;
 }
 
-/* Returns 1 keep-alive, 0 close. Handles pipelined requests in a loop.
+/* Box pbuf bytes [b, b+n) into the conn slab (slow-path entry). Grows
+ * the slab exactly like the old recv loop (lazy 2K start, doubling to the
+ * 32K HDR+BODY cap). 0 ok, -1 on over-cap/OOM (caller closes). */
+static int box_pbuf(struct conn_hot *c, const char *b, unsigned int n) {
+    while (c->rlen + n > c->rcap) {
+        unsigned int ncap = c->rcap ? c->rcap * 2 : SLAB_INIT;
+        if (ncap > HDR_CAP + BODY_CAP) ncap = HDR_CAP + BODY_CAP;
+        if (ncap <= c->rcap || c->rlen + n > ncap) return -1; /* cap hit */
+        char *nb = slab_take(ncap);
+        if (!nb) return -1;
+        int ci = slab_class_for(ncap);
+        unsigned int take_cap = (ci >= 0) ? SLAB_SZ[ci] : ncap;
+        if (c->rbuf) {
+            if (c->rlen) memcpy(nb, c->rbuf, c->rlen);
+            slab_release(c->rbuf, c->rcap);
+        }
+        c->rbuf = nb; c->rcap = take_cap;
+    }
+    memcpy(c->rbuf + c->rlen, b, n);
+    c->rlen += n;
+    return 0;
+}
+
+static int handle_data_boxed(struct conn_hot *c);
+
+/* Pass 18 fast path: rlen==0 (nothing boxed yet). One recv into the next
+ * pbuf ring slot, parse in place, and -- when the datagram holds exactly one
+ * complete request -- dispatch zero-copy and return the slot by cursor
+ * advance. Partial (need-more) or pipelined bytes are boxed into the slab
+ * and handled by the unchanged slow path below (one extra EAGAIN recv at
+ * most). Same contract: 1 keep-alive, 0 close, HTTP_DEFERRED handling. */
+static int handle_data(struct conn_hot *c) {
+    if (c->state == CONN_PG_WAIT) return 1; /* waiting: ignore client events */
+    if (c->cold->wbuf) { /* stalled sender: drain first, don't grow backlog */
+        if (drain_pending(c) != 0) return 0;
+        if (c->cold->wbuf) return 1;
+    }
+    if (c->rlen > 0) return handle_data_boxed(c); /* partial already boxed */
+    char *pb = pbuf_next();
+    if (!pb) return handle_data_boxed(c); /* ring OOM: fall back to slab */
+    ssize_t r = recv(c->fd, pb, PBUF_SZ, 0);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+        return 0;
+    }
+    if (r == 0) return 0; /* peer closed */
+    http_req_t rq;
+    int n = http_parse(pb, (size_t)r, &rq);
+    if (n == -2) return 0; /* body too large: close (out of scope) */
+    if (n < 0) return 0;   /* malformed: close */
+    if ((size_t)n < (size_t)r) {
+        /* Partial or pipelined: box everything, take the slow path. */
+        if (box_pbuf(c, pb, (unsigned int)r) != 0) return 0;
+        return handle_data_boxed(c);
+    }
+    /* Exactly one complete request: zero-copy dispatch (rq points into pb,
+     * valid for this call; http_defer dups everything it keeps). */
+    c->req_count++;
+    long up = current_uptime_s();
+    int ka = http_respond(c, &rq, up);
+    c->last_active = t_w.cached_wall;
+    wheel_rearm(c, t_w.cached_wall); /* O(1) same-slot; relink on 1s roll */
+    if (ka == HTTP_DEFERRED) {
+        pg_waiter_add(c->cold->pend.slot); /* new waiter enters PG_WAIT */
+        net_arm_pg(c->cold->pend.slot);
+        return 1; /* keep waiting; resume on PG readiness */
+    }
+    if (c->cold->wbuf) return 1; /* EAGAIN stash: wait for EPOLLOUT */
+    if (!ka) return 0;
+    if (c->req_count >= MAX_REQS) return 0; /* close after 1000 reqs */
+    slab_maybe_shrink(c);
+    return 1;
+}
+
+/* Slow path (was handle_data): slab recv + pipelining loop, unchanged.
+ * Returns 1 keep-alive, 0 close. Handles pipelined requests in a loop.
  * HTTP_DEFERRED from http_respond means the request is stashed in PG_WAIT:
  * shift consumed bytes, arm the PG socket, and stop pipelining until resume. */
-static int handle_data(struct conn_hot *c) {
+static int handle_data_boxed(struct conn_hot *c) {
     if (c->state == CONN_PG_WAIT) return 1; /* waiting: ignore client events */
     if (c->cold->wbuf) { /* stalled sender: drain first, don't grow backlog */
         if (drain_pending(c) != 0) return 0;
@@ -654,7 +848,7 @@ static int wheel_poll_waiters(int slot, int want_sent) {
     return progress;
 }
 
-static void handle_pg_ready(int slot) {
+static void handle_pg_ready_one(int slot) {
     for (int pass = 0; pass < 8; pass++) {
         int progress = 0;
         /* Phase 1: poll waiters with a query in flight. */
@@ -690,6 +884,84 @@ static void handle_pg_ready(int slot) {
         }
     }
     net_gc_pg();
+}
+
+/* Pass 17: packed read completions. When any R slot fires, drain ALL R
+ * waiters in one wheel sweep per phase instead of one slot per epoll event.
+ * Each read keeps its own Sync/autocommit timing (per-slot PQflush/poll
+ * inside http_resume); packing only batches completions per pass so a
+ * 20-row feed burst completes in fewer wakeups. Single in-flight per conn
+ * is preserved (wheel_poll_waiters single-slot path is untouched for W).
+ * No shared-txn group commit: writes keep their own Sync each. */
+static int wheel_poll_reads_packed(int want_sent) {
+    int any = 0;
+    for (int q = 0; q < PG_R_NSLOTS; q++) {
+        if (t_pg_waiters[q] > 0) { any = 1; break; }
+    }
+    if (!any) return 0;
+    int progress = 0;
+    for (int w = 0; w < WHEEL_N; w++) {
+        struct conn_hot *c = t_wheel[w];
+        while (c) {
+            struct conn_hot *nx = c->next; /* resume may relink/free c */
+            if (c->state == CONN_PG_WAIT && c->cold->pend.slot < PG_R_NSLOTS &&
+                (c->cold->pend.sent == want_sent)) {
+                int was_sent = c->cold->pend.sent;
+                int wslot = c->cold->pend.slot;
+                int r = http_resume(c);
+                if (r == HTTP_DEFERRED) {
+                    if (c->cold->pend.sent != was_sent) progress = 1;
+                    net_arm_pg(wslot);
+                } else {
+                    pg_waiter_del(wslot);
+                    progress = 1;
+                    finish_completed(c, r);
+                }
+            }
+            c = nx;
+        }
+    }
+    return progress;
+}
+
+
+static void handle_pg_ready(int slot) {
+    if (slot >= 0 && slot < PG_R_NSLOTS) {
+        /* Packed R path: shared pass over all R waiters (fewer wakeups). */
+        for (int pass = 0; pass < 8; pass++) {
+            int progress = 0;
+            progress |= wheel_poll_reads_packed(1);
+            progress |= wheel_poll_reads_packed(0);
+            if (!progress) break;
+        }
+        /* Airtight kick: a queued R waiter facing a free R slot must not
+         * stall (socket idle, no POLLIN ahead). Retry one optimistically. */
+        {
+            int done = 0;
+            for (int w = 0; w < WHEEL_N && !done; w++) {
+                struct conn_hot *c = t_wheel[w];
+                while (c && !done) {
+                    struct conn_hot *nx = c->next;
+                    if (c->state == CONN_PG_WAIT &&
+                        c->cold->pend.slot < PG_R_NSLOTS && !c->cold->pend.sent) {
+                        int wslot = c->cold->pend.slot;
+                        int r = http_resume(c);
+                        if (r == HTTP_DEFERRED) {
+                            net_arm_pg(wslot);
+                        } else {
+                            pg_waiter_del(wslot);
+                            finish_completed(c, r);
+                        }
+                        done = 1;
+                    }
+                    c = nx;
+                }
+            }
+        }
+        net_gc_pg();
+        return;
+    }
+    handle_pg_ready_one(slot);
 }
 
 void *worker_main(void *arg) {
@@ -759,14 +1031,36 @@ void *worker_main(void *arg) {
     }
 
     struct epoll_event events[256];
+    int coal_streak = 0;  /* consecutive light batches */
+    int coal_drain = 0;   /* next epoll_wait uses timeout 0 (redrain) */
     tick_now(); /* seed cached clocks before any pg/time use */
+    /* Pass 18: per-thread pbuf ring (1024x2KB = fixed 2MB, allocated
+     * once at worker startup so it lands in baseline RSS, outside per-conn
+     * idle math) + PROVIDE_BUFFERS to the ring (bgid 1). Recv-multishot
+     * support is probed and logged; the data path stays on the epoll
+     * fallback (per-conn multishot lifecycle -- cancel-on-close, PG_WAIT
+     * stash, pipelining order -- needs its own pass). */
+    if (pbuf_init() != 0) {
+        fprintf(stderr, "worker %ld: pbuf ring alloc failed\n", idx);
+        exit(1);
+    }
+    int recv_mshot = 0;
+    if (have_uring && pbuf_provide(&ring) == 0) {
+        uring_drain(&ring, epfd, t_w.cached_wall, &uring_einval); /* soak provide CQE */
+        recv_mshot = uring_recv_mshot_probe();
+    }
+    fprintf(stderr, "worker %ld: pbuf ring 1024x2KB %s, recv-multishot %s, epoll recv active\n",
+            idx, have_uring ? "provided" : "ready",
+            recv_mshot ? "supported" : "unsupported-or-fallback");
     time_t last_sweep = t_w.cached_wall;
 #ifdef DEBUG_SLAB
     unsigned long sweep_n = 0;
 #endif
 
     while (1) {
-        int n = epoll_wait(epfd, events, 256, 1000); /* 1s idle sweep tick */
+        int coal_timeout = coal_drain ? 0 : 1000; /* 1s idle sweep tick */
+        coal_drain = 0;
+        int n = epoll_wait(epfd, events, 256, coal_timeout);
 #ifdef DEBUG_TICK
         { /* Pass 10 temp: tick-latency probe (compile out by default). */
             struct timespec _t0, _t1;
@@ -892,6 +1186,20 @@ void *worker_main(void *arg) {
                     conn_free(c, epfd); /* unlinks from the wheel internally */
                     net_gc_pg();
                 }
+            }
+        }
+        /* Pass 16b: gated coalesce; busy (n>=COAL_N) or idle (n==0)
+         * resets the streak and never sleeps. Only K consecutive light
+         * batches sleep 500us; the next epoll_wait(0) redrains the slept
+         * window into a bigger batch. n<0 is EINTR/break above. */
+        if (n >= COAL_N || n == 0) {
+            coal_streak = 0;
+        } else if (n > 0) {
+            if (++coal_streak >= COAL_K) {
+                struct timespec coal_ts = { 0, COAL_NS };
+                nanosleep(&coal_ts, NULL);
+                coal_streak = 0;
+                coal_drain = 1;
             }
         }
     }

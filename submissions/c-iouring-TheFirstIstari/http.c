@@ -12,6 +12,7 @@
 #include <strings.h>
 #include <time.h>
 #include <libdeflate.h>
+#include "picohttpparser.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -30,112 +31,93 @@ static int ci_eq(const char *a, size_t al, const char *b) {
     return strncasecmp(a, b, bl) == 0;
 }
 
-static const char *find_crlf(const char *p, const char *end) {
-    for (; p + 1 < end; p++) if (p[0] == '\r' && p[1] == '\n') return p;
-    return NULL;
-}
+/* Pass 18: HTTP/1.x request-line + headers via vendored picohttpparser
+ * (pinned h2o commit, static; parse-in-place, zero-copy: method/path/header
+ * values point into buf, no NUL termination, no per-request malloc).
+ * Wire semantics match the hand parser it replaces: routes, auth-before-id,
+ * strict id validation, 16K header / 16K body caps, query/trailing-slash
+ * 404s, Connection/Accept-Encoding handling.
+ * Known fail-closed deltas (all untested edges): a non-HTTP/1.x version
+ * token (e.g. HTTP/2.0) now fails the parse (close) instead of defaulting
+ * to 1.1; >64 headers fail instead of scanning on; SP before the header
+ * colon fails instead of trimming. Transfer-Encoding stays ignored
+ * (Content-Length rules), exactly as before. */
+#define PICO_MAX_HEADERS 64
 
 int http_parse(const char *buf, size_t len, http_req_t *out) {
     memset(out, 0, sizeof *out);
     out->method = -1; out->content_length = -1;
     out->ver_major = 1; out->ver_minor = 1;
-    if (len < 16) return 0;
-    const char *end = buf + len;
-    /* Request line: METHOD SP TARGET SP HTTP/1.x CRLF */
-    const char *sp1 = memchr(buf, ' ', (size_t)(end - buf));
-    if (!sp1) return 0; /* need more */
-    const char *sp2 = NULL;
-    /* find next space after sp1+1, but only within first line */
-    const char *eol = find_crlf(buf, end);
-    if (!eol) {
-        if (len > 16384) return -1;
-        return 0;
-    }
-    for (const char *p = sp1 + 1; p < eol; p++) if (*p == ' ') { sp2 = p; break; }
-    if (!sp2) return -1;
-    size_t mlen = (size_t)(sp1 - buf);
-    if (mlen == 3 && memcmp(buf, "GET", 3) == 0) out->method = 0;
-    else if (mlen == 4 && memcmp(buf, "POST", 4) == 0) out->method = 1;
-    else out->method = -1;
-    out->target = sp1 + 1;
-    out->target_len = (size_t)(sp2 - (sp1 + 1));
-    /* version */
-    const char *ver = sp2 + 1;
-    if ((size_t)(eol - ver) >= 8 && memcmp(ver, "HTTP/1.", 7) == 0 &&
-        (ver[7] == '0' || ver[7] == '1')) {
-        out->ver_major = 1; out->ver_minor = ver[7] - '0';
-    } else if ((size_t)(eol - ver) >= 6 && memcmp(ver, "HTTP/", 5) == 0) {
-        out->ver_major = 1; out->ver_minor = 1;
-    } else {
-        return -1;
-    }
-    /* Headers: scan lines until \r\n\r\n */
-    const char *hs = eol + 2;
-    const char *hdr_end = NULL;
-    for (const char *p = hs; p + 3 < end; p++) {
-        if (p[0]=='\r' && p[1]=='\n' && p[2]=='\r' && p[3]=='\n') { hdr_end = p + 4; break; }
-    }
-    if (!hdr_end) {
+    const char *method = NULL, *path = NULL;
+    size_t method_len = 0, path_len = 0;
+    int minor = 1;
+    struct phr_header hdrs[PICO_MAX_HEADERS];
+    size_t nhdrs = PICO_MAX_HEADERS;
+    int pret = phr_parse_request(buf, len, &method, &method_len,
+                                 &path, &path_len, &minor,
+                                 hdrs, &nhdrs, 0);
+    if (pret == -2) {
+        /* Incomplete: wait for more, but never past the 32K slab cap
+         * (the conn path closes past HDR_CAP+BODY_CAP anyway). */
         if (len > 16384 + 16384) return -1;
-        if (len > 16384 && (size_t)(end - buf) > 16384) {
-            return 0; /* wait until cap then caller closes */
-        }
         return 0;
     }
-    if ((size_t)(hdr_end - buf) > 16384) return -1;
-    out->header_len = (size_t)(hdr_end - buf);
-    /* Walk header lines */
-    const char *line = hs;
-    while (line < hdr_end - 2) {
-        const char *le = find_crlf(line, hdr_end);
-        if (!le) break;
-        if (le == line) break; /* empty line = end */
-        const char *colon = memchr(line, ':', (size_t)(le - line));
-        if (colon) {
-            const char *nm = line; size_t nl = (size_t)(colon - line);
-            while (nl && (nm[nl-1]==' '||nm[nl-1]=='\t')) nl--;
-            const char *vs = colon + 1; size_t vl = (size_t)(le - vs);
-            while (vl && (*vs==' '||*vs=='\t')) { vs++; vl--; }
-            while (vl && (vs[vl-1]==' '||vs[vl-1]=='\t')) vl--;
-            if (ci_eq(nm, nl, "content-length")) {
-                char tmp[32]; size_t c = vl < sizeof tmp - 1 ? vl : sizeof tmp - 1;
-                memcpy(tmp, vs, c); tmp[c] = '\0';
-                long v = -1;
-                if (c > 0) {
-                    char *e = NULL; v = strtol(tmp, &e, 10);
-                    if (e == tmp) v = -1;
-                }
-                out->content_length = v;
-            } else if (ci_eq(nm, nl, "authorization")) {
-                out->auth = vs; out->auth_len = vl;
-            } else if (ci_eq(nm, nl, "connection")) {
-                out->connection = vs; out->connection_len = vl;
-            } else if (ci_eq(nm, nl, "accept-encoding")) {
-                /* Pass 7: feed-first gzip. Token search, case-insensitive,
-                 * separators are comma/space/tab/semicolon. */
-                for (size_t k = 0; k + 4 <= vl; k++) {
-                    if (((vs[k] | 32) == 'g') && ((vs[k+1] | 32) == 'z') &&
-                        ((vs[k+2] | 32) == 'i') && ((vs[k+3] | 32) == 'p')) {
-                        char pb = (k == 0) ? ',' : vs[k-1];
-                        char nb = (k + 4 >= vl) ? ',' : vs[k+4];
-                        int pok = (pb == ',' || pb == ' ' || pb == '\t');
-                        int nok = (nb == ',' || nb == ' ' || nb == '\t' || nb == ';');
-                        if (pok && nok) { out->accept_gzip = 1; break; }
-                    }
-                }
-            } else if (ci_eq(nm, nl, "host")) {
-                /* scanned only. */
+    if (pret < 0) return -1;             /* malformed: caller closes */
+    if ((size_t)pret > 16384) return -1; /* header cap 16K */
+    if (method_len == 3 && memcmp(method, "GET", 3) == 0) out->method = 0;
+    else if (method_len == 4 && memcmp(method, "POST", 4) == 0) out->method = 1;
+    else out->method = -1;               /* unknown method -> 404 below */
+    out->target = path;
+    out->target_len = path_len;
+    out->ver_major = 1;
+    out->ver_minor = (minor == 0) ? 0 : 1;
+    out->header_len = (size_t)pret;
+    for (size_t i = 0; i < nhdrs; i++) {
+        const char *nm = hdrs[i].name;
+        size_t nl = hdrs[i].name_len;
+        const char *vs = hdrs[i].value;
+        size_t vl = hdrs[i].value_len;
+        if (!nm) continue; /* folded continuation line: ignore as before */
+        while (nl && (nm[nl-1] == ' ' || nm[nl-1] == '\t')) nl--;
+        while (vl && (*vs == ' ' || *vs == '\t')) { vs++; vl--; }
+        while (vl && (vs[vl-1] == ' ' || vs[vl-1] == '\t')) vl--;
+        if (ci_eq(nm, nl, "content-length")) {
+            char tmp[32]; size_t c = vl < sizeof tmp - 1 ? vl : sizeof tmp - 1;
+            memcpy(tmp, vs, c); tmp[c] = '\0';
+            long v = -1;
+            if (c > 0) {
+                char *e = NULL; v = strtol(tmp, &e, 10);
+                if (e == tmp) v = -1;
             }
+            out->content_length = v;
+        } else if (ci_eq(nm, nl, "authorization")) {
+            out->auth = vs; out->auth_len = vl;
+        } else if (ci_eq(nm, nl, "connection")) {
+            out->connection = vs; out->connection_len = vl;
+        } else if (ci_eq(nm, nl, "accept-encoding")) {
+            /* Pass 7: feed-first gzip. Token search, case-insensitive,
+             * separators are comma/space/tab/semicolon. */
+            for (size_t k = 0; k + 4 <= vl; k++) {
+                if (((vs[k] | 32) == 'g') && ((vs[k+1] | 32) == 'z') &&
+                    ((vs[k+2] | 32) == 'i') && ((vs[k+3] | 32) == 'p')) {
+                    char pb = (k == 0) ? ',' : vs[k-1];
+                    char nb = (k + 4 >= vl) ? ',' : vs[k+4];
+                    int pok = (pb == ',' || pb == ' ' || pb == '\t');
+                    int nok = (nb == ',' || nb == ' ' || nb == '\t' || nb == ';');
+                    if (pok && nok) { out->accept_gzip = 1; break; }
+                }
+            }
+        } else if (ci_eq(nm, nl, "host")) {
+            /* scanned only. */
         }
-        line = le + 2;
     }
     long cl = out->content_length;
     if (cl < 0) cl = 0;
-    if (cl > 16384) return -2; /* body too large (out of scope) */
-    if ((size_t)(end - hdr_end) < (size_t)cl) return 0; /* need body */
-    out->body = hdr_end;
+    if (cl > 16384) return -2; /* body too large: close (out of scope) */
+    if (len - (size_t)pret < (size_t)cl) return 0; /* need body */
+    out->body = buf + pret;
     out->body_len = (size_t)cl;
-    return (int)(out->header_len + (size_t)cl);
+    return (int)((size_t)pret + (size_t)cl);
 }
 
 int http_send(int fd, const char *hdr, size_t hlen, const char *body, size_t blen) {
@@ -636,7 +618,11 @@ static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
         memcpy(ch, rq->connection, cn);
         ch[cn] = '\0';
     }
-    int slot = pg_claim_slot();
+    /* Pass 17: R/W-split claim. Reads (health/feed/post) take R slots,
+     * writes (mkpost/like) take W slots with their own Sync/autocommit.
+     * Each write is committed before its response (autocommit); no
+     * shared-txn group commit. */
+    int slot = pg_claim_slot_for_route(route);
     const char *par[2] = { p0, p1 };
     int rc = pg_send_async(slot, stmt, npar, npar ? par : NULL);
     int fd = pg_socket(slot);

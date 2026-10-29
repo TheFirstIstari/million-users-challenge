@@ -29,7 +29,22 @@ int pg_like(const char *uid, const char *pid, int *already, char *errbuf, size_t
 #define PG_POLL_READY 1
 #define PG_POLL_ERROR -1
 
-/* Round-robin slot claim shared with the blocking path. */
+/* Pass 17: R/W-split pools. Per-thread 32 conns = 24R (slots 0..23) + 8W
+ * (slots 24..31); 16 workers -> 384R+128W = 512 max. Reads (health/feed/post)
+ * use R slots round-robin; writes (mkpost/like) use W slots round-robin with
+ * their own Sync/autocommit (each write committed before its response;
+ * no shared-txn group commit). */
+#define PG_POOL_R 24
+#define PG_POOL_W 8
+#define PG_POOL_N 32
+#define PG_R_END 24
+int pg_claim_slot_R(void);
+int pg_claim_slot_W(void);
+/* Route-aware claim: MKPOST/LIKE -> W, else R. Route values are PG_ROUTE_*
+ * from net.h (4=MKPOST, 5=LIKE); takes int to avoid a header cycle. */
+int pg_claim_slot_for_route(int route);
+int pg_slot_is_write(int slot);
+/* Round-robin slot claim shared with the blocking path (legacy: any pool). */
 int pg_claim_slot(void);
 /* Send one prepared query on slot. OKBUSY/ERR as above. Single in-flight
  * per conn is preserved; BUSY means the slot is still busy. */
@@ -43,6 +58,8 @@ int pg_poll(int slot, PGresult **out);
 int pg_socket(int slot);
 /* Number of slots with an async query in flight on this thread. */
 int pg_busy_count(void);
+int pg_busy_count_R(void);
+int pg_busy_count_W(void);
 /* 1 when libpq still holds unsent bytes for the slot (arm POLLOUT too),
  * else 0 (EPOLLIN suffices; an idle PG socket is always writable). */
 int pg_need_write(int slot);

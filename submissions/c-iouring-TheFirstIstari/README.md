@@ -2,7 +2,7 @@
 
 C11 feed API: one process, N worker threads, io_uring multishot accept with an
 epoll fallback, a per-thread libpq connection pool, HS256 JWT auth, and a
-flat hand-written HTTP/JSON layer. No framework, no router, no ORM.
+picohttpparser-based HTTP layer (vendored, parse-in-place, zero-copy) with a flat hand-written JSON layer. No framework, no router, no ORM.
 
 Passes 6–14 are all in this tree (async libpq, feed-first gzip, binary
 protocol, lazy slabs + tick clocks, 64 B hot split, 128-slot wheel, O(1)
@@ -18,6 +18,7 @@ close guards, per-slot waiter counts, 50 k saturation). `test/test.sh` is
 | Postgres driver | libpq from `postgresql-libs 18.6-4.1` | `libpq-dev` |
 | Crypto (HMAC-SHA256) | `openssl 3.6.4-1.1` | `libssl-dev` |
 | gzip (level 1, feed-first) | vendored `libdeflate 1.26` (static, `vendor/`) | none (vendored) |
+| HTTP/1.x parser | vendored `picohttpparser dd573d8` (static, `vendor/`) | none (vendored) |
 | Database | `postgres:18` (see `test/run.sh`) | — |
 
 Build flags (`Makefile`): `-O3 -march=x86-64-v3 -flto -Wall -Wextra
@@ -146,6 +147,10 @@ Routes (`http.c`): `GET /health`, `GET /feed`, `GET /posts/<id>`,
 - **EAGAIN stash (Pass 9):** a partial `sendmsg` stashes the unsent tail in
   `conn_cold.wbuf/wlen/woff` and re-arms `EPOLLOUT` — no response is ever
   dropped on a full socket.
+
+## Recv (Pass 18: per-thread pbuf ring, 1024x2KB, epoll fallback)
+
+Each worker recvs into the next slot of a fixed 2 MB thread-local pbuf ring and parses in place (zero-copy); the slot is returned by cursor advance at handler return and only partial/pipelined requests are boxed into the size-class slab. The ring is also `PROVIDE_BUFFERS`-registered with the io_uring instance (bgid 1); recv-multishot support is probed at startup and logged, while the data path stays on the epoll fallback. Per-idle-conn owned memory is `conn_hot` (64 B) + `conn_cold` (128 B) in one malloc block (~220 B with overhead, no read buffer on the fast path) -- under 500 B by construction.
 
 ## Gzip (Pass 7: feed-first, level 1, ≥1024 B; Pass 15: libdeflate)
 

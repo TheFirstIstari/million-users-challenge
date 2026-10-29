@@ -55,7 +55,7 @@ defmodule Feed.Application do
          end)
     opts = [strategy: :one_for_one, name: Feed.Supervisor]
     {:ok, sup} = Supervisor.start_link(children, opts)
-    Logger.info("[pool] shards=#{shards} sizes=#{inspect(Enum.map(pg_children, fn {Postgrex, o} -> Keyword.fetch!(o, :pool_size) end))} total=#{pool_size} prepare=named queue_target=50 queue_interval=1000 timeout=5000")
+    Logger.info("[pool] shards=#{shards} total=#{pool_size} prepare=named queue_target=50 queue_interval=1000 timeout=5000")
     Logger.info("[http] compress=false")
     warmup()
     {:ok, sup}
@@ -94,7 +94,7 @@ defmodule Feed.Application do
       for i <- 1..s do
         size = if i <= rem, do: base + 1, else: base
         name = Module.concat(Feed, "PG#{i}")
-        {Postgrex, pg_opts |> Keyword.put(:name, name) |> Keyword.put(:pool_size, size)}
+        Supervisor.child_spec({Postgrex, pg_opts |> Keyword.put(:name, name) |> Keyword.put(:pool_size, size)}, id: {:pg, i})
       end
     {s, children}
   end

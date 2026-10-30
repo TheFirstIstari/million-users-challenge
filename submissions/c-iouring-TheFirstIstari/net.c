@@ -25,7 +25,11 @@
 #define MAX_REQS 1000
 #define IDLE_S 80
 #define HDR_TIMEOUT_S 20
-#define MAX_CONNS_PER_WORKER 64000
+/* 128k conns/worker: 4-core (4 workers) needs >250k for the 225k run
+ * (64k x 4 = 256k capped it); 16-core (16 workers) needs 1M/16 = 62500 for
+ * 1M, and 16 x 128k = 2M total stays under LimitNOFILE 2M. Per-conn idle is
+ * ~220B + lazy slabs, so the worst case fits well under 32GB. */
+#define MAX_CONNS_PER_WORKER 128000
 #define PG_NSLOTS 32
 #define PG_R_NSLOTS 24 /* Pass 17: slots 0..23 = R, 24..31 = W */
 
@@ -565,10 +569,15 @@ static void net_arm_pg(int slot) {
 }
 
 /* Drop PG arming for slots with no waiters (level-triggered POLLOUT would
- * otherwise spin while idle). */
+ * otherwise spin while idle). Also heal ownerless busy slots: a waiter
+ * freed mid-flight (or a transport-error failover) can leave a slot busy
+ * with no one left to poll it; the heal frees it once its orphan query
+ * completes. Only heals when the waiter count is zero, so it can never
+ * steal a live waiter's result (see pg_send_async ownership gate). */
 static void net_gc_pg(void) {
     if (t_w.epfd < 0) return;
     for (int s = 0; s < PG_NSLOTS; s++) {
+        if (t_pg_waiters[s] == 0 && pg_slot_busy(s)) pg_slot_heal(s);
         if (!t_w.pg_armed[s]) continue;
         if (t_pg_waiters[s] == 0) { /* O(1): no waiter on this slot */
             epoll_ctl(t_w.epfd, EPOLL_CTL_DEL, t_w.pg_fd[s], NULL);

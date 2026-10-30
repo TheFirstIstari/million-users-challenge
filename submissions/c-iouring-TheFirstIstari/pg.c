@@ -223,14 +223,26 @@ int pg_claim_slot(void) {
 }
 
 /* Pass 17: pool-aware claims. R and W have independent round-robins so a
- * read burst cannot starve writes and vice versa. */
+ * read burst cannot starve writes and vice versa.
+ * 404 fix: prefer an idle slot (bounded scan from the cursor) so waiters
+ * share a slot only when the whole pool is genuinely in flight; sharing is
+ * what forced queued/BUSY retries and stole results pre-fix. When every
+ * slot is busy, fall back to round-robin (the waiter queues, sent==0). */
 int pg_claim_slot_R(void) {
+    for (int i = 0; i < POOL_R; i++) {
+        int s = (int)((t_rr_r + (unsigned)i) % POOL_R);
+        if (!t_async_busy[s]) { t_rr_r = (unsigned)s + 1; return s; }
+    }
     int s = (int)(t_rr_r % POOL_R);
     t_rr_r++;
     return s;
 }
 
 int pg_claim_slot_W(void) {
+    for (int i = 0; i < POOL_W; i++) {
+        int s = POOL_W_BASE + (int)((t_rr_w + (unsigned)i) % POOL_W);
+        if (!t_async_busy[s]) { t_rr_w = (unsigned)(s - POOL_W_BASE) + 1; return s; }
+    }
     int s = POOL_W_BASE + (int)(t_rr_w % POOL_W);
     t_rr_w++;
     return s;
@@ -353,6 +365,16 @@ static void set_err(char *eb, size_t ecap, PGconn *c, PGresult *r) {
 
 int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) {
     if (slot < 0 || slot >= POOL_N || !stmt) return PG_ASYNC_ERR;
+    /* Ownership gate (404 fix): a slot with a query in flight is owned by
+     * its waiter until that waiter polls the result. Never consume/discard
+     * here: the bytes may be another waiter's complete-but-unpolled result,
+     * and discarding it cross-wires the slot to a foreign result (e.g. a
+     * FEED result rendered as a single post -> bogus 404 for a post that
+     * exists, growing with load/slot-sharing). A busy slot simply queues
+     * the new waiter (BUSY); its retry runs only after the owner polled
+     * and freed the slot. True orphans (no live waiter) are reclaimed by
+     * pg_slot_heal(), which net calls only when the slot has no waiters. */
+    if (t_async_busy[slot]) return PG_ASYNC_BUSY;
     PGconn *c = t_pool[slot];
     if (!c || PQstatus(c) == CONNECTION_BAD) {
         if (c) PQfinish(c);
@@ -364,9 +386,8 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
         t_async_busy[slot] = 0;
         t_need_wr[slot] = 0;
     }
-    /* Self-heal orphaned input: a previous waiter may have gone away while
-     * its query was in flight. If libpq is busy, consume once; if the query
-     * has since completed, discard the stale results and take the slot. */
+    /* Ownerless stale input only (busy==0 above, so no live waiter will
+     * poll this input; discarding it cannot steal anyone's result). */
     if (PQisBusy(c)) {
         if (!PQconsumeInput(c)) {
             if (PQstatus(c) == CONNECTION_BAD) {
@@ -391,7 +412,8 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
             t_need_wr[slot] = 0;
         }
     }
-    if (t_async_busy[slot]) return PG_ASYNC_BUSY;
+    /* t_async_busy[slot]==0 here (gated at entry; every path above either
+     * returns or leaves it clear), so the send below owns the slot. */
     const char *sql = sql_for_stmt(stmt);
     int ok = PQsendQueryPrepared(c, stmt, npar, par, NULL, NULL, 1);
     if (!ok) {
@@ -531,6 +553,53 @@ int pg_socket(int slot) {
     PGconn *c = t_pool[slot];
     if (!c) return -1;
     return PQsocket(c);
+}
+
+int pg_slot_busy(int slot) {
+    if (slot < 0 || slot >= POOL_N) return 0;
+    return t_async_busy[slot] ? 1 : 0;
+}
+
+/* Reclaim a slot with no live waiter (the caller in net guarantees the
+ * waiter count is zero, so no owner can be polled concurrently: this is
+ * single-threaded and the owner always holds its waiter count). Covers
+ * waiters freed mid-flight (client gone, sweep) and transport-error races
+ * where the waiter already failed over to the blocking path: if the orphan
+ * query has completed (or the conn is bad), discard the stale results and
+ * free the slot; if it is still in flight, leave it for a later heal.
+ * Never touches a slot that has a live waiter, so it cannot steal results. */
+void pg_slot_heal(int slot) {
+    if (slot < 0 || slot >= POOL_N) return;
+    PGconn *c = t_pool[slot];
+    if (!c) { t_async_busy[slot] = 0; t_need_wr[slot] = 0; return; }
+    if (PQstatus(c) == CONNECTION_BAD) {
+        PQfinish(c);
+        t_pool[slot] = NULL;
+        t_async_busy[slot] = 0;
+        t_need_wr[slot] = 0;
+        t_recon++;
+        pg_report_maybe();
+        return;
+    }
+    (void)PQflush(c);
+    if (!PQconsumeInput(c)) {
+        if (PQstatus(c) == CONNECTION_BAD) {
+            PQfinish(c);
+            t_pool[slot] = NULL;
+            t_async_busy[slot] = 0;
+            t_need_wr[slot] = 0;
+            t_recon++;
+            pg_report_maybe();
+        }
+        return;
+    }
+    if (PQisBusy(c)) return; /* still in flight: a later heal frees it */
+    {
+        PGresult *d;
+        while ((d = PQgetResult(c)) != NULL) PQclear(d);
+    }
+    t_async_busy[slot] = 0;
+    t_need_wr[slot] = 0;
 }
 
 /* ---- render helpers (shared by blocking + async completion) ---- */

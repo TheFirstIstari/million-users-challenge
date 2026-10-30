@@ -560,6 +560,19 @@ static int extract_body(const char *b, size_t n, char *dec, size_t deccap,
     return found ? 1 : 0;
 }
 
+/* 404-mismatch tripwire (must stay silent in production: every logged line
+ * is a lost post under load). Capped per thread so a regression cannot
+ * flood the log; validation greps for POST404 and expects zero lines. */
+static _Thread_local unsigned t_post404_n = 0;
+static void log_post404(const char *where, const char *want_id, PGresult *res) {
+    if (t_post404_n >= 16) return;
+    t_post404_n++;
+    int nt = res ? PQntuples(res) : -1;
+    int st = res ? (int)PQresultStatus(res) : -1;
+    fprintf(stderr, "POST404 %s want=%s ntuples=%d status=%d\n",
+            where, want_id ? want_id : "-", nt, st);
+}
+
 void http_pending_free(struct pg_pending *p) {
     if (!p) return;
     free(p->p0); p->p0 = NULL;
@@ -623,7 +636,11 @@ static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
      * Each write is committed before its response (autocommit); no
      * shared-txn group commit. */
     int slot = pg_claim_slot_for_route(route);
-    const char *par[2] = { p0, p1 };
+    /* Send with the heap copies (same bytes the stash keeps): the caller's
+     * p0/p1 may be stack (ids[]) or thread-local (t_dec) buffers that the
+     * next request reuses. libpq copies synchronously, but the heap copies
+     * remove any lifetime question entirely. */
+    const char *par[2] = { cp0, cp1 };
     int rc = pg_send_async(slot, stmt, npar, npar ? par : NULL);
     int fd = pg_socket(slot);
     if (fd < 0 || rc == PG_ASYNC_ERR) {
@@ -859,6 +876,7 @@ static int resume_blocking(struct conn_hot *c, http_req_t *tmp) {
         if (r == 0) {
             send_resp_ex(c, tmp, 200, "OK", body, bl, 0, bl >= GZIP_MIN_POST);
         } else if (r == -2) {
+            log_post404("blocking", p->p0, NULL);
             send_resp(c, tmp, 404, "Not Found", JERR_POST_NOT_FOUND, strlen(JERR_POST_NOT_FOUND), 0);
         } else {
             send_resp(c, tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);
@@ -968,6 +986,7 @@ int http_resume(struct conn_hot *c) {
         if (r == 0) {
             send_resp_ex(c, &tmp, 200, "OK", body, bl, 0, bl >= GZIP_MIN_POST);
         } else if (r == -2) {
+            log_post404("resume", p->p0, res);
             send_resp(c, &tmp, 404, "Not Found", JERR_POST_NOT_FOUND, strlen(JERR_POST_NOT_FOUND), 0);
         } else {
             send_resp(c, &tmp, 500, "Internal Server Error", JERR_INTERNAL, strlen(JERR_INTERNAL), 0);

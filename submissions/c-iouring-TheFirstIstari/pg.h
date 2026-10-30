@@ -31,9 +31,11 @@ int pg_like(const char *uid, const char *pid, int *already, char *errbuf, size_t
 
 /* Pass 17: R/W-split pools. Per-thread 32 conns = 24R (slots 0..23) + 8W
  * (slots 24..31); 16 workers -> 384R+128W = 512 max. Reads (health/feed/post)
- * use R slots round-robin; writes (mkpost/like) use W slots round-robin with
- * their own Sync/autocommit (each write committed before its response;
- * no shared-txn group commit). */
+ * use R slots, writes (mkpost/like) use W slots with their own
+ * Sync/autocommit (each write committed before its response; no shared-txn
+ * group commit). Claims prefer an idle slot and queue (BUSY) on a busy one
+ * only when the whole pool is in flight, so one slot maps to one in-flight
+ * query at a time. */
 #define PG_POOL_R 24
 #define PG_POOL_W 8
 #define PG_POOL_N 32
@@ -56,6 +58,12 @@ int pg_poll(int slot, PGresult **out);
 /* Underlying socket for epoll arming, or -1 when unusable (caller must use
  * the blocking pg_run fallback). */
 int pg_socket(int slot);
+/* 1 when the slot has an async query in flight (pure flag read, no syscall). */
+int pg_slot_busy(int slot);
+/* Reclaim an ownerless slot (caller guarantees no live waiter on it).
+ * Nonblocking; frees the slot when the orphan query completed or the conn
+ * is bad, else leaves it for a later heal. */
+void pg_slot_heal(int slot);
 /* Number of slots with an async query in flight on this thread. */
 int pg_busy_count(void);
 int pg_busy_count_R(void);

@@ -362,8 +362,22 @@ static void set_err(char *eb, size_t ecap, PGconn *c, PGresult *r) {
 }
 
 /* ---- Pass 6 async primitives ---- */
+/* Pass 19 (Greptile #13): explicit per-slot owner. Only the owner that
+ * claimed the slot (owner pointer + claim generation ogen) may consume its
+ * result. A recycled conn struct reuses addresses, so the pointer alone is
+ * not enough -- the monotonic per-thread generation disambiguates. Orphan
+ * reclaim (pg_slot_heal) runs only when no live waiter exists, so it can
+ * never race a live owner in this single-threaded worker. */
+static _Thread_local void *t_async_owner[POOL_N];
+static _Thread_local unsigned t_async_own_gen[POOL_N];
 
-int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) {
+static inline void slot_clear_owner(int slot) {
+    t_async_owner[slot] = NULL;
+    t_async_own_gen[slot] = 0;
+}
+
+int pg_send_async(int slot, const char *stmt, int npar, const char *const *par,
+                  void *owner, unsigned ogen) {
     if (slot < 0 || slot >= POOL_N || !stmt) return PG_ASYNC_ERR;
     /* Ownership gate (404 fix): a slot with a query in flight is owned by
      * its waiter until that waiter polls the result. Never consume/discard
@@ -395,6 +409,7 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
                 t_pool[slot] = NULL;
                 t_async_busy[slot] = 0;
                 t_need_wr[slot] = 0;
+                slot_clear_owner(slot);
                 c = pg_connect_one();
                 t_pool[slot] = c;
                 t_recon++;
@@ -410,6 +425,7 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
             while ((d = PQgetResult(c)) != NULL) PQclear(d);
             t_async_busy[slot] = 0;
             t_need_wr[slot] = 0;
+            slot_clear_owner(slot);
         }
     }
     /* t_async_busy[slot]==0 here (gated at entry; every path above either
@@ -427,6 +443,7 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
             t_pool[slot] = NULL;
             t_async_busy[slot] = 0;
             t_need_wr[slot] = 0;
+            slot_clear_owner(slot);
             c = pg_connect_one();
             t_pool[slot] = c;
             t_recon++;
@@ -444,6 +461,8 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
         }
     }
     t_async_busy[slot] = 1;
+    t_async_owner[slot] = owner;
+    t_async_own_gen[slot] = ogen;
     /* Pass 9: completion-latency clock sampled 1-in-64 with the query op. */
     if ((t_qops & 63) == 0) {
         clock_gettime(CLOCK_MONOTONIC, &t_async_t0[slot]);
@@ -463,6 +482,7 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
             t_pool[slot] = NULL;
             t_async_busy[slot] = 0;
             t_need_wr[slot] = 0;
+            slot_clear_owner(slot);
             t_recon++;
             pg_report_maybe();
             return PG_ASYNC_ERR;
@@ -473,18 +493,25 @@ int pg_send_async(int slot, const char *stmt, int npar, const char *const *par) 
     return PG_ASYNC_OK;
 }
 
-int pg_poll(int slot, PGresult **out) {
+int pg_poll(int slot, PGresult **out, void *owner, unsigned ogen) {
     if (out) *out = NULL;
     if (slot < 0 || slot >= POOL_N) return PG_POLL_ERROR;
     PGconn *c = t_pool[slot];
-    if (!c) { t_async_busy[slot] = 0; t_need_wr[slot] = 0; return PG_POLL_ERROR; }
+    if (!c) { t_async_busy[slot] = 0; t_need_wr[slot] = 0; slot_clear_owner(slot); return PG_POLL_ERROR; }
     if (!t_async_busy[slot]) return PG_POLL_ERROR;
+    /* Owner check (Greptile #13): a foreign waiter must never consume
+     * another waiter's completed result. PENDING leaves the slot untouched;
+     * the true owner will poll it. Pointer reuse across free/malloc is
+     * disambiguated by the claim generation. */
+    if (t_async_owner[slot] != owner || t_async_own_gen[slot] != ogen)
+        return PG_POLL_PENDING;
     int fl = PQflush(c);
     if (fl == -1) {
         PQfinish(c);
         t_pool[slot] = NULL;
         t_async_busy[slot] = 0;
         t_need_wr[slot] = 0;
+        slot_clear_owner(slot);
         t_recon++;
         pg_report_maybe();
         return PG_POLL_ERROR;
@@ -500,6 +527,7 @@ int pg_poll(int slot, PGresult **out) {
             t_pool[slot] = NULL;
             t_async_busy[slot] = 0;
             t_need_wr[slot] = 0;
+            slot_clear_owner(slot);
             t_recon++;
             pg_report_maybe();
             return PG_POLL_ERROR;
@@ -514,6 +542,7 @@ int pg_poll(int slot, PGresult **out) {
     }
     t_async_busy[slot] = 0;
     t_need_wr[slot] = 0;
+    slot_clear_owner(slot);
     if (t_async_sampled[slot]) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -561,22 +590,24 @@ int pg_slot_busy(int slot) {
 }
 
 /* Reclaim a slot with no live waiter (the caller in net guarantees the
- * waiter count is zero, so no owner can be polled concurrently: this is
- * single-threaded and the owner always holds its waiter count). Covers
- * waiters freed mid-flight (client gone, sweep) and transport-error races
- * where the waiter already failed over to the blocking path: if the orphan
- * query has completed (or the conn is bad), discard the stale results and
- * free the slot; if it is still in flight, leave it for a later heal.
+ * waiter count is zero AND the slot's owner generation has no live waiter,
+ * so no owner can be polled concurrently: this is single-threaded and the
+ * owner always holds its waiter count). Covers waiters freed mid-flight
+ * (client gone, sweep) and transport-error races where the waiter already
+ * failed over to the blocking path: if the orphan query has completed (or
+ * the conn is bad), discard the stale results and free the slot; if it is
+ * still in flight, leave it for a later heal.
  * Never touches a slot that has a live waiter, so it cannot steal results. */
 void pg_slot_heal(int slot) {
     if (slot < 0 || slot >= POOL_N) return;
     PGconn *c = t_pool[slot];
-    if (!c) { t_async_busy[slot] = 0; t_need_wr[slot] = 0; return; }
+    if (!c) { t_async_busy[slot] = 0; t_need_wr[slot] = 0; slot_clear_owner(slot); return; }
     if (PQstatus(c) == CONNECTION_BAD) {
         PQfinish(c);
         t_pool[slot] = NULL;
         t_async_busy[slot] = 0;
         t_need_wr[slot] = 0;
+        slot_clear_owner(slot);
         t_recon++;
         pg_report_maybe();
         return;
@@ -588,6 +619,7 @@ void pg_slot_heal(int slot) {
             t_pool[slot] = NULL;
             t_async_busy[slot] = 0;
             t_need_wr[slot] = 0;
+            slot_clear_owner(slot);
             t_recon++;
             pg_report_maybe();
         }
@@ -600,6 +632,7 @@ void pg_slot_heal(int slot) {
     }
     t_async_busy[slot] = 0;
     t_need_wr[slot] = 0;
+    slot_clear_owner(slot);
 }
 
 /* ---- render helpers (shared by blocking + async completion) ---- */

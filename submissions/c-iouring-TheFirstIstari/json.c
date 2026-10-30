@@ -273,26 +273,218 @@ static const char *skip_ws(const char *p, const char *e) {
     return p;
 }
 
-/* Find '"key"\s*:' ; returns pointer just past ':' or NULL. */
+/* Validate a JSON string inner payload (escapes legal, no raw controls).
+ * Also rejects lone surrogates / bad \uXXXX so skipped strings are held to
+ * the same grammar as decoded ones (Greptile #2: invalid JSON must not be
+ * silently accepted). Returns 1 valid, 0 invalid. */
+static int jstr_inner_valid(const char *s, size_t n) {
+    for (size_t i = 0; i < n;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\') {
+            if (++i >= n) return 0;
+            char e2 = s[i++];
+            switch (e2) {
+            case '"': case '\\': case '/': case 'b': case 'f':
+            case 'n': case 'r': case 't':
+                break;
+            case 'u': {
+                unsigned cp = 0;
+                if (i + 4 > n) return 0;
+                for (int k = 0; k < 4; k++) {
+                    char h = s[i + k];
+                    int v = (h >= '0' && h <= '9') ? h - '0'
+                        : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                        : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                    if (v < 0) return 0;
+                    cp = (cp << 4) | (unsigned)v;
+                }
+                i += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    unsigned lo = 0;
+                    if (i + 6 > n || s[i] != '\\' || s[i + 1] != 'u') return 0;
+                    for (int k = 0; k < 4; k++) {
+                        char h = s[i + 2 + k];
+                        int v = (h >= '0' && h <= '9') ? h - '0'
+                            : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                            : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                        if (v < 0) return 0;
+                        lo = (lo << 4) | (unsigned)v;
+                    }
+                    if (lo < 0xDC00 || lo > 0xDFFF) return 0;
+                    i += 6;
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    return 0;
+                }
+                break;
+            }
+            default:
+                return 0;
+            }
+            continue;
+        }
+        if (c < 0x20) return 0; /* raw control (incl NUL): malformed */
+        i++;
+    }
+    return 1;
+}
+
+/* Skip one JSON value with full grammar validation (strings validated,
+ * numbers strict, depth-capped containers). Returns past the value or NULL.
+ * Depth cap 32: JWT payloads are flat; anything deeper fails closed. */
+#define JSKIP_MAX_DEPTH 32
+static const char *jval_end_d(const char *p, const char *e, int depth) {
+    if (depth > JSKIP_MAX_DEPTH) return NULL;
+    p = skip_ws(p, e);
+    if (p >= e) return NULL;
+    if (*p == '"') {
+        const char *q = p + 1;
+        int esc = 0, closed = 0;
+        while (q < e) {
+            char ch = *q;
+            if (esc) esc = 0;
+            else if (ch == '\\') esc = 1;
+            else if (ch == '"') { closed = 1; break; }
+            else if ((unsigned char)ch < 0x20) return NULL;
+            q++;
+        }
+        if (!closed) return NULL;
+        if (!jstr_inner_valid(p + 1, (size_t)(q - (p + 1)))) return NULL;
+        return q + 1;
+    }
+    if (*p == '{') {
+        p = skip_ws(p + 1, e);
+        if (p < e && *p == '}') return p + 1;
+        while (1) {
+            if (p >= e || *p != '"') return NULL;
+            const char *q = p + 1;
+            int esc = 0, closed = 0;
+            while (q < e) {
+                char ch = *q;
+                if (esc) esc = 0;
+                else if (ch == '\\') esc = 1;
+                else if (ch == '"') { closed = 1; break; }
+                else if ((unsigned char)ch < 0x20) return NULL;
+                q++;
+            }
+            if (!closed) return NULL;
+            if (!jstr_inner_valid(p + 1, (size_t)(q - (p + 1)))) return NULL;
+            p = skip_ws(q + 1, e);
+            if (p >= e || *p != ':') return NULL;
+            p = jval_end_d(p + 1, e, depth + 1);
+            if (!p) return NULL;
+            p = skip_ws(p, e);
+            if (p >= e) return NULL;
+            if (*p == ',') { p = skip_ws(p + 1, e); continue; }
+            if (*p == '}') return p + 1;
+            return NULL;
+        }
+    }
+    if (*p == '[') {
+        p = skip_ws(p + 1, e);
+        if (p < e && *p == ']') return p + 1;
+        while (1) {
+            p = jval_end_d(p, e, depth + 1);
+            if (!p) return NULL;
+            p = skip_ws(p, e);
+            if (p >= e) return NULL;
+            if (*p == ',') { p = skip_ws(p + 1, e); continue; }
+            if (*p == ']') return p + 1;
+            return NULL;
+        }
+    }
+    if (*p == 't') {
+        if ((size_t)(e - p) >= 4 && memcmp(p, "true", 4) == 0) return p + 4;
+        return NULL;
+    }
+    if (*p == 'f') {
+        if ((size_t)(e - p) >= 5 && memcmp(p, "false", 5) == 0) return p + 5;
+        return NULL;
+    }
+    if (*p == 'n') {
+        if ((size_t)(e - p) >= 4 && memcmp(p, "null", 4) == 0) return p + 4;
+        return NULL;
+    }
+    /* strict number: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? */
+    {
+        const char *q = p;
+        if (q < e && *q == '-') q++;
+        if (q >= e) return NULL;
+        if (*q == '0') { q++; }
+        else if (*q >= '1' && *q <= '9') { while (q < e && *q >= '0' && *q <= '9') q++; }
+        else return NULL;
+        if (q < e && *q == '.') {
+            q++;
+            const char *fs = q;
+            while (q < e && *q >= '0' && *q <= '9') q++;
+            if (q == fs) return NULL;
+        }
+        if (q < e && (*q == 'e' || *q == 'E')) {
+            q++;
+            if (q < e && (*q == '+' || *q == '-')) q++;
+            const char *es = q;
+            while (q < e && *q >= '0' && *q <= '9') q++;
+            if (q == es) return NULL;
+        }
+        if (q == p) return NULL;
+        return q;
+    }
+}
+
+/* Find top-level "key":value in a JSON object; returns the pointer to the
+ * value start (past ':') or NULL (missing OR malformed -> fail closed).
+ * Greptile #4: the old scan matched nested keys ({"extra":{"sub":"2"}} took
+ * the inner "sub"); only depth-1 members are considered, keys are
+ * escape-decoded before compare ({"\u0073ub":...} == "sub"), and the payload
+ * must be a well-formed object (validated values, strict separators). */
 static const char *find_key(const char *js, size_t len, const char *key) {
     const char *e = js + len;
     size_t kl = strlen(key);
-    if (len < kl + 2) return NULL;
-    int in_str = 0, esc = 0;
-    for (size_t i = 0; i + kl + 2 <= len; i++) {
-        char ch = js[i];
-        if (in_str) {
+    const char *p = skip_ws(js, e);
+    if (p >= e || *p != '{') return NULL;
+    p = skip_ws(p + 1, e);
+    if (p >= e) return NULL;
+    if (*p == '}') return NULL; /* empty object: key absent */
+    const char *found = NULL;
+    while (p < e) {
+        if (*p != '"') return NULL;
+        const char *q = p + 1;
+        int esc = 0, closed = 0;
+        while (q < e) {
+            char ch = *q;
             if (esc) esc = 0;
             else if (ch == '\\') esc = 1;
-            else if (ch == '"') in_str = 0;
-            continue;
+            else if (ch == '"') { closed = 1; break; }
+            else if ((unsigned char)ch < 0x20) return NULL;
+            q++;
         }
-        if (ch != '"') continue;
-        if (memcmp(js + i + 1, key, kl) == 0 && js[i + 1 + kl] == '"') {
-            const char *p = skip_ws(js + i + 1 + kl + 1, e);
-            if (p < e && *p == ':') return p + 1;
+        if (!closed) return NULL;
+        size_t ilen = (size_t)(q - (p + 1));
+        if (!jstr_inner_valid(p + 1, ilen)) return NULL;
+        int match = 0;
+        if (ilen == kl && memcmp(p + 1, key, kl) == 0) {
+            match = 1; /* fast path: no escapes */
+        } else if (memchr(p + 1, '\\', ilen) != NULL && ilen < 64) {
+            char kd[64];
+            if (json_decode_string(p + 1, ilen, kd, sizeof kd) != (size_t)-1 &&
+                strlen(kd) == kl && memcmp(kd, key, kl) == 0)
+                match = 1;
         }
-        in_str = 1;
+        p = skip_ws(q + 1, e);
+        if (p >= e || *p != ':') return NULL;
+        p = skip_ws(p + 1, e);
+        if (p >= e) return NULL;
+        if (match && !found) found = p;
+        p = jval_end_d(p, e, 0);
+        if (!p) return NULL;
+        p = skip_ws(p, e);
+        if (p >= e) return NULL;
+        if (*p == ',') { p = skip_ws(p + 1, e); if (p >= e) return NULL; continue; }
+        if (*p == '}') {
+            /* Whole object must be well-formed; trailing garbage fails. */
+            if (skip_ws(p + 1, e) != e) return NULL;
+            return found; /* NULL when absent, value ptr when present */
+        }
+        return NULL;
     }
     return NULL;
 }
@@ -315,6 +507,11 @@ int json_scan_string(const char *js, size_t len, const char *key, char *out, siz
     return 0;
 }
 
+/* Greptile #5: parse the FULL numeric value including fraction and base-10
+ * exponent. The old code skipped the exponent suffix, so 2000000000e-10
+ * (== 0.2, expired) compared as 2000000000 (accepted). Value computed in
+ * long double with bounded scaling loops (<= 60 iterations, saturation at
+ * 9e18), strict grammar, and a required value terminator. */
 int json_scan_number(const char *js, size_t len, const char *key, long long *out) {
     const char *e = js + len;
     const char *p = find_key(js, len, key);
@@ -323,25 +520,84 @@ int json_scan_number(const char *js, size_t len, const char *key, long long *out
     if (p >= e) return -1;
     int neg = 0;
     if (*p == '-') { neg = 1; p++; }
-    if (p >= e || *p < '0' || *p > '9') return -1;
-    long long v = 0;
-    while (p < e && *p >= '0' && *p <= '9') {
-        int d = *p - '0';
-        if (v > (LLONG_MAX - d) / 10) v = LLONG_MAX;
-        else v = v * 10 + d;
-        p++;
-    }
-    /* tolerate fraction / exponent suffixes */
+    if (p >= e) return -1;
+    long double v = 0;
+    if (*p == '0') { p++; }
+    else if (*p >= '1' && *p <= '9') {
+        while (p < e && *p >= '0' && *p <= '9') { v = v * 10.0L + (*p - '0'); p++; }
+    } else return -1;
     if (p < e && *p == '.') {
         p++;
-        while (p < e && *p >= '0' && *p <= '9') p++;
+        const char *fs = p;
+        long double fdiv = 10.0L;
+        int fdig = 0;
+        while (p < e && *p >= '0' && *p <= '9' && fdig < 64) {
+            v += (*p - '0') / fdiv;
+            fdiv *= 10.0L;
+            p++;
+            fdig++;
+        }
+        while (p < e && *p >= '0' && *p <= '9') p++; /* ignore beyond 64 frac digits */
+        if (p == fs) return -1;
     }
+    long e10 = 0;
     if (p < e && (*p == 'e' || *p == 'E')) {
         p++;
-        if (p < e && (*p == '+' || *p == '-')) p++;
-        while (p < e && *p >= '0' && *p <= '9') p++;
+        int eneg = 0;
+        if (p < e && (*p == '+' || *p == '-')) { eneg = (*p == '-'); p++; }
+        const char *es = p;
+        long eabs = 0;
+        while (p < e && *p >= '0' && *p <= '9') {
+            if (eabs < 1000000L) eabs = eabs * 10 + (*p - '0');
+            p++;
+        }
+        if (p == es) return -1;
+        e10 = eneg ? -eabs : eabs;
     }
-    *out = neg ? -v : v;
+    /* value must terminate cleanly (ws or structural char) */
+    if (p < e && *p != ',' && *p != '}' && *p != ']' &&
+        *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+        return -1;
+    if (e10 > 60 || e10 < -60) {
+        /* Huge exponent: decide by decimal order (exact, no overflow).
+         * Covers 2000000000e-10 style claims and hostile 1e±999999. */
+        if (v == 0) { *out = 0; return 0; }
+        int ord = 0, guard = 0;
+        long double t = v; /* v > 0 here; sign applied below */
+        while (t >= 10.0L && guard++ < 10000) { t /= 10.0L; ord++; }
+        guard = 0;
+        while (t < 1.0L && guard++ < 10000) { t *= 10.0L; ord--; }
+        long tord = (long)ord + e10;
+        long double r;
+        if (!neg) {
+            if (tord > 18) { *out = LLONG_MAX; return 0; }
+            if (tord < 0) { *out = 0; return 0; }
+            r = t;
+            for (long i = 0; i < tord; i++) r *= 10.0L;
+            *out = (r >= 9.0e18L) ? LLONG_MAX : (long long)r;
+        } else {
+            if (tord > 18) { *out = LLONG_MIN; return 0; }
+            if (tord < 0) { *out = 0; return 0; }
+            r = t;
+            for (long i = 0; i < tord; i++) r *= 10.0L;
+            r = -r;
+            *out = (r <= -9.0e18L) ? LLONG_MIN : (long long)r;
+        }
+        return 0;
+    }
+    if (e10 > 0) {
+        for (long i = 0; i < e10; i++) {
+            v *= 10.0L;
+            if (v >= 9.0e18L) break;
+        }
+        if (v >= 9.0e18L) v = 9.0e18L;
+    } else if (e10 < 0) {
+        for (long i = 0; i < -e10; i++) v /= 10.0L;
+    }
+    if (neg) v = -v;
+    if (v >= 9.0e18L) *out = LLONG_MAX;
+    else if (v <= -9.0e18L) *out = LLONG_MIN;
+    else *out = (long long)v;
     return 0;
 }
 

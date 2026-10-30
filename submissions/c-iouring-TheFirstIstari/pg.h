@@ -49,12 +49,21 @@ int pg_slot_is_write(int slot);
 /* Round-robin slot claim shared with the blocking path (legacy: any pool). */
 int pg_claim_slot(void);
 /* Send one prepared query on slot. OKBUSY/ERR as above. Single in-flight
- * per conn is preserved; BUSY means the slot is still busy. */
-int pg_send_async(int slot, const char *stmt, int npar, const char *const *par);
-/* Poll a busy slot. PENDING = not ready; READY = *out holds the PGresult
+ * per conn is preserved; BUSY means the slot is still busy.
+ * Pass 19 (Greptile #13 hardening): the sender is recorded as the slot's
+ * explicit owner (owner pointer + claim generation ogen). Only that owner
+ * may poll/consume the result; a foreign waiter gets PENDING without
+ * touching the slot, so a recycled/shared slot can never cross-wire a
+ * result (the 404 class). Orphan slots (no live waiter) are reclaimed by
+ * pg_slot_heal, which the net layer calls only when the waiter count is
+ * zero -- never while an owner is live. */
+int pg_send_async(int slot, const char *stmt, int npar, const char *const *par,
+                  void *owner, unsigned ogen);
+/* Poll a busy slot. PENDING = not ready (or not ours: foreign owner+gen --
+ * the slot is left untouched); READY = *out holds the PGresult
  * (caller owns it, must PQclear even on query-error results); ERROR =
  * transport failure (slot already reset for reconnect-on-demand). */
-int pg_poll(int slot, PGresult **out);
+int pg_poll(int slot, PGresult **out, void *owner, unsigned ogen);
 /* Underlying socket for epoll arming, or -1 when unusable (caller must use
  * the blocking pg_run fallback). */
 int pg_socket(int slot);

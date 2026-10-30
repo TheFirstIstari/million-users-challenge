@@ -359,6 +359,11 @@ static void send_resp_ex(struct conn_hot *c, const http_req_t *rq, int code, con
     }
     char hdr[256];
     int close_it = force_close || wants_close(rq) || c->req_count >= 999;
+    /* Greptile #11: a Connection:close response that EAGAIN-stashes must be
+     * sent to the last byte BEFORE the close (old code freed the conn with
+     * the stash unsent -> truncation; and a drained-then-idle close verdict
+     * could be lost). Mark close_after_drain and stay open; drain_pending
+     * closes once the stash is empty. */
     if (likely(st != NULL)) {
         /* Gzip fast path: only when the route allows it AND the client
          * asked. Any compression failure falls through to identity. */
@@ -375,7 +380,10 @@ static void send_resp_ex(struct conn_hot *c, const http_req_t *rq, int code, con
                 memcpy(p, ce, cl); p += cl;
                 if (send_via_conn(c, hdr, (size_t)(p - hdr), (const char *)gz, gzlen) != 0)
                     c->keep_alive = 0;
-                else
+                else if (close_it && c->cold->wbuf) {
+                    c->cold->close_after_drain = 1;
+                    c->keep_alive = 1;
+                } else
                     c->keep_alive = !close_it;
                 return;
             }
@@ -388,7 +396,10 @@ static void send_resp_ex(struct conn_hot *c, const http_req_t *rq, int code, con
         memcpy(p, ce, cl); p += cl;
         if (send_via_conn(c, hdr, (size_t)(p - hdr), body, blen) != 0)
             c->keep_alive = 0;
-        else
+        else if (close_it && c->cold->wbuf) {
+            c->cold->close_after_drain = 1;
+            c->keep_alive = 1;
+        } else
             c->keep_alive = !close_it;
         return;
     }
@@ -419,24 +430,86 @@ static const char *jws(const char *p, const char *e) {
     return p;
 }
 
-/* String at *p == '"': inner in [s,n), returns past closing quote or NULL. */
+/* Validate a JSON string inner payload (escapes legal, no raw controls,
+ * surrogate pairs well-formed). 1 valid, 0 invalid. Mirrors json.c's
+ * checker so skipped/ignored strings are held to the decoded grammar. */
+static int hstr_inner_valid(const char *s, size_t n) {
+    for (size_t i = 0; i < n;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\') {
+            if (++i >= n) return 0;
+            char e2 = s[i++];
+            switch (e2) {
+            case '"': case '\\': case '/': case 'b': case 'f':
+            case 'n': case 'r': case 't':
+                break;
+            case 'u': {
+                unsigned cp = 0;
+                if (i + 4 > n) return 0;
+                for (int k = 0; k < 4; k++) {
+                    char h = s[i + k];
+                    int v = (h >= '0' && h <= '9') ? h - '0'
+                        : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                        : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                    if (v < 0) return 0;
+                    cp = (cp << 4) | (unsigned)v;
+                }
+                i += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    unsigned lo = 0;
+                    if (i + 6 > n || s[i] != '\\' || s[i + 1] != 'u') return 0;
+                    for (int k = 0; k < 4; k++) {
+                        char h = s[i + 2 + k];
+                        int v = (h >= '0' && h <= '9') ? h - '0'
+                            : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                            : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+                        if (v < 0) return 0;
+                        lo = (lo << 4) | (unsigned)v;
+                    }
+                    if (lo < 0xDC00 || lo > 0xDFFF) return 0;
+                    i += 6;
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    return 0;
+                }
+                break;
+            }
+            default:
+                return 0;
+            }
+            continue;
+        }
+        if (c < 0x20) return 0;
+        i++;
+    }
+    return 1;
+}
+
+/* String at *p == '"': inner in [s,n), returns past closing quote or NULL.
+ * Greptile #2: raw control bytes (incl NUL) inside a string are malformed. */
 static const char *jstr_end(const char *p, const char *e, const char **s, size_t *n) {
     const char *q = p + 1;
     while (q < e) {
         if (*q == '\\') { q += 2; continue; }
+        if ((unsigned char)*q < 0x20) return NULL;
         if (*q == '"') { *s = p + 1; *n = (size_t)(q - (p + 1)); return q + 1; }
         q++;
     }
     return NULL;
 }
 
-/* Skip one JSON value; returns past it or NULL. */
+/* Skip one JSON value; returns past it or NULL.
+ * Greptile #2: every skipped string (keys at any depth, ignored values) is
+ * escape/controls-validated, so {"body":"ok","extra":"\q"} is malformed
+ * instead of silently creating a post. */
 static const char *jskip(const char *p, const char *e) {
     p = jws(p, e);
     if (p >= e) return NULL;
     if (*p == '"') {
         const char *s; size_t n;
-        return jstr_end(p, e, &s, &n);
+        const char *np = jstr_end(p, e, &s, &n);
+        if (!np) return NULL;
+        if (!hstr_inner_valid(s, n)) return NULL;
+        return np;
     }
     if (*p == '{') {
         p++;
@@ -448,6 +521,7 @@ static const char *jskip(const char *p, const char *e) {
             if (p >= e || *p != '"') return NULL;
             p = jstr_end(p, e, &s, &n);
             if (!p) return NULL;
+            if (!hstr_inner_valid(s, n)) return NULL;
             p = jws(p, e);
             if (p >= e || *p != ':') return NULL;
             p = jskip(p + 1, e);
@@ -531,11 +605,24 @@ static int extract_body(const char *b, size_t n, char *dec, size_t deccap,
         if (p >= e || *p != ':') return -1;
         p = jws(p + 1, e);
         if (p >= e) return -1;
-        int is_body = (kn == 4 && memcmp(ks, "body", 4) == 0);
+        /* Greptile #1: keys are escape-decoded before compare, so
+         * {"\u0062ody":"hello"} matches "body". Greptile #2: every key and
+         * every ignored value is validated (bad escapes / raw controls ->
+         * malformed), so {"body":"ok","extra":"\q"} cannot create a post. */
+        if (!hstr_inner_valid(ks, kn)) return -1;
+        int is_body = 0;
+        if (kn == 4 && memcmp(ks, "body", 4) == 0) {
+            is_body = 1; /* fast path: no escapes */
+        } else if (memchr(ks, '\\', kn) != NULL && kn < 64) {
+            char kd[64];
+            if (json_decode_string(ks, kn, kd, sizeof kd) == (size_t)-1) return -1;
+            if (strcmp(kd, "body") == 0) is_body = 1;
+        }
         if (*p == '"') {
             const char *vs; size_t vn;
             np = jstr_end(p, e, &vs, &vn);
             if (!np) return -1;
+            if (!hstr_inner_valid(vs, vn)) return -1;
             if (is_body && !found) {
                 size_t dl = json_decode_string(vs, vn, dec, deccap);
                 if (dl == (size_t)-1) return -1;
@@ -589,6 +676,13 @@ void http_pending_free(struct pg_pending *p) {
     p->conn_hdr_len = 0;
     p->uptime_s = 0;
     p->accept_gzip = 0;
+    p->pg_gen = 0;
+    /* NOTE: wq_owner/wq_next/wq_prev are NOT cleared here. The waiter node
+     * stays listed until net.c unlinks it (pg_waiter_del_node, called by the
+     * resume-completion and conn-free paths with the links intact). Clearing
+     * the node without unlinking would leave a zombie in the per-slot list:
+     * on malloc address reuse + re-defer the stale head pointer self-loops
+     * the list and hangs the completion poll forever. */
 }
 
 static char *dup_str(const char *s) {
@@ -639,9 +733,16 @@ static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
     /* Send with the heap copies (same bytes the stash keeps): the caller's
      * p0/p1 may be stack (ids[]) or thread-local (t_dec) buffers that the
      * next request reuses. libpq copies synchronously, but the heap copies
-     * remove any lifetime question entirely. */
+     * remove any lifetime question entirely.
+     * Pass 19 (Greptile #13 hardening): every in-flight slot has an explicit
+     * owner (this conn) plus a claim generation. pg_poll refuses to let a
+     * different owner consume the result, so a recycled/shared slot can
+     * never cross-wire a foreign result (the 404 class). */
+    static _Thread_local unsigned t_pg_gen = 0;
+    unsigned g = ++t_pg_gen;
+    if (g == 0) g = ++t_pg_gen; /* gen 0 = unlinked; never hand it out */
     const char *par[2] = { cp0, cp1 };
-    int rc = pg_send_async(slot, stmt, npar, npar ? par : NULL);
+    int rc = pg_send_async(slot, stmt, npar, npar ? par : NULL, c, g);
     int fd = pg_socket(slot);
     if (fd < 0 || rc == PG_ASYNC_ERR) {
         free(cp0); free(cp1); free(ca); free(ch);
@@ -663,6 +764,7 @@ static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
     c->cold->pend.conn_hdr_len = rq->connection_len;
     c->cold->pend.uptime_s = uptime_s;
     c->cold->pend.accept_gzip = rq->accept_gzip ? 1 : 0;
+    c->cold->pend.pg_gen = g;
     return HTTP_DEFERRED;
 }
 
@@ -753,6 +855,14 @@ int http_respond(struct conn_hot *c, const http_req_t *rq, long uptime_s) {
         }
         if (unlikely(pr == 0 || !is_string)) {
             send_resp(c, rq, 400, "Bad Request", JERR_BODY_REQUIRED, strlen(JERR_BODY_REQUIRED), 0);
+            return c->keep_alive;
+        }
+        /* Greptile #3: reject embedded NULs before the DB. A body like
+         * "a\u0000bbbb" decodes to bytes containing NUL; strlen-based copies
+         * would truncate while body_len stays long (heap over-read in
+         * render). Fail closed here so t_dec is NUL-free past declen. */
+        if (unlikely(memchr(t_dec, '\0', declen) != NULL)) {
+            send_resp(c, rq, 400, "Bad Request", JERR_MALFORMED_JSON, strlen(JERR_MALFORMED_JSON), 0);
             return c->keep_alive;
         }
         size_t tl2 = json_trim_inplace(t_dec, declen);
@@ -933,11 +1043,13 @@ int http_resume(struct conn_hot *c) {
     tmp.connection = p->conn_hdr;
     tmp.connection_len = p->conn_hdr_len;
     tmp.accept_gzip = p->accept_gzip;
-    /* Still queued behind a busy slot: retry the send. */
+    /* Still queued behind a busy slot: retry the send. The ownership gate
+     * (same owner+gen) guarantees the retry only fires once the slot is
+     * genuinely free, never on a foreign in-flight query. */
     if (!p->sent) {
         const char *stmt = stmt_for_route(p->route);
         const char *par[2] = { p->p0, p->p1 };
-        int rc = pg_send_async(p->slot, stmt, p->npar, p->npar ? par : NULL);
+        int rc = pg_send_async(p->slot, stmt, p->npar, p->npar ? par : NULL, c, p->pg_gen);
         int fd = pg_socket(p->slot);
         if (fd < 0 || rc == PG_ASYNC_ERR) {
             return resume_blocking(c, &tmp);
@@ -946,7 +1058,9 @@ int http_resume(struct conn_hot *c) {
         p->sent = 1;
     }
     PGresult *res = NULL;
-    int pr = pg_poll(p->slot, &res);
+    /* Owner-checked poll: a non-owner (stale/foreign waiter) never consumes
+     * another waiter's completed result (Greptile #13). */
+    int pr = pg_poll(p->slot, &res, c, p->pg_gen);
     if (pr == PG_POLL_PENDING) return HTTP_DEFERRED;
     if (pr == PG_POLL_ERROR) {
         if (res) PQclear(res);

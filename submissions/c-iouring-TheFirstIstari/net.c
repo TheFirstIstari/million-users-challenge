@@ -117,7 +117,7 @@ static void slab_release(char *p, unsigned cap) {
 }
 
 /* One malloc per conn: hot (offset 0, 64B-aligned) + cold (offset 64) in a
- * single block. Zeroed like the old calloc. wheel_slot=-1 until the timing
+ * single block. Zeroed like the old calloc. wprev==NULL until the timing
  * wheel links it on register. */
 static struct conn_hot *conn_alloc(void) {
     void *mem = NULL;
@@ -126,7 +126,8 @@ static struct conn_hot *conn_alloc(void) {
     memset(mem, 0, total);
     struct conn_hot *c = (struct conn_hot *)mem;
     c->cold = (struct conn_cold *)((char *)mem + sizeof(struct conn_hot));
-    c->wheel_slot = -1;
+    c->wprev = NULL;
+    c->next = NULL;
     return c;
 }
 
@@ -134,13 +135,16 @@ static struct conn_hot *conn_alloc(void) {
  * wheel, 1s per slot; slot(t) = t % 128. Max timeout is IDLE_S+1 = 81s
  * < 128, so every conn is visited exactly once, at its expiry second; the
  * 1s tick expires only slots in (last_sweep, now] -- O(expired), not
- * O(nconns), killing the per-second L1d flush at 1M conns. Conns link
- * intrusively via wheel_slot/next (hot stays 64B); conn_free() unlinks, so
- * every close path is covered. wheel_rearm() is O(1) when the second has
- * not rolled (same slot, early-out); otherwise one unlink from a short
- * slot list plus a head insert. */
+ * O(nconns), killing the per-second L1d flush at 1M conns.
+ * Pass 19 (Greptile #6): per-slot doubly-linked lists with a sentinel head
+ * (next/wprev intrusive in hot, which stays exactly 64B). Unlink and
+ * insert are both O(1) -- the old singly-linked unlink scanned the whole
+ * slot list (O(n^2) on mass-close bursts). conn_free() unlinks, so every
+ * close path is covered. wheel_rearm() always unlinks+reinserts (O(1));
+ * the old same-slot early-out is gone because no slot index is stored, but
+ * both halves are pointer swaps either way. */
 #define WHEEL_N 128
-static _Thread_local struct conn_hot *t_wheel[WHEEL_N];
+static _Thread_local struct conn_hot t_wheel_head[WHEEL_N];
 
 /* Pass 12: O(1) per-batch liveness guard. The old guard re-scanned the whole
  * timing wheel (O(nconns)) on every client event to detect a conn freed by
@@ -158,21 +162,69 @@ static _Thread_local struct conn_hot *t_closed[CLOSED_CAP];
 static _Thread_local int t_closed_n;
 static _Thread_local int t_closed_overflow;
 
-/* Pass 13: per-PG-slot waiter counts. Every PG_WAIT conn is counted under
- * its claimed PG slot: inc when http_respond defers a new waiter (the sole
- * PG_WAIT entry point, in handle_data), dec when a resume completes (the
- * sole PG_WAIT exit in wheel_poll_waiters / the handle_pg_ready kick) or
- * when a PG_WAIT conn is freed (sweep expiry / close paths via conn_free,
- * which sees state==CONN_PG_WAIT only before any resume dec, so no double
- * count). Lets net_gc_pg disarm waiter-less slots and wheel_poll_waiters
- * skip waiter-less PG events without scanning the 128-slot wheel. */
+/* Pass 13: per-PG-slot waiter counts + Pass 19 (Greptile #12) intrusive
+ * per-slot DB waiter lists. Every PG_WAIT conn is counted under its claimed
+ * PG slot: inc when http_respond defers a new waiter (the sole PG_WAIT
+ * entry point, in handle_data), dec when a resume completes (the sole
+ * PG_WAIT exit in wheel_poll_waiters / the handle_pg_ready kick) or when a
+ * PG_WAIT conn is freed (sweep expiry / close paths via conn_free, which
+ * sees state==CONN_PG_WAIT only before any resume dec, so no double
+ * count). Counts let net_gc_pg disarm waiter-less slots and let completion
+ * skip waiter-less PG events; the intrusive per-slot list (t_pg_qhead,
+ * wq_* links in the cold stash) makes each completion O(waiters on that
+ * slot) instead of scanning the 128-slot timing wheel (O(1M idles) per DB
+ * event under load). Linked exactly while state==CONN_PG_WAIT; unlink
+ * happens on completion or free, never twice (wq_owner NULLs on unlink). */
 static _Thread_local int t_pg_waiters[PG_NSLOTS];
+static _Thread_local struct pg_pending *t_pg_qhead[PG_NSLOTS];
 
-static inline void pg_waiter_add(int slot) {
-    if (slot >= 0 && slot < PG_NSLOTS) t_pg_waiters[slot]++;
+static inline void waiter_unlink(struct pg_pending *p, int slot) {
+    if (!p->wq_owner) return; /* already unlinked */
+    if (p->wq_prev) {
+        p->wq_prev->wq_next = p->wq_next;
+    } else if (slot >= 0 && slot < PG_NSLOTS && t_pg_qhead[slot] == p) {
+        t_pg_qhead[slot] = p->wq_next;
+    }
+    if (p->wq_next) p->wq_next->wq_prev = p->wq_prev;
+    p->wq_next = NULL;
+    p->wq_prev = NULL;
+    p->wq_owner = NULL;
 }
 
-static inline void pg_waiter_del(int slot) {
+static inline void waiter_link(struct conn_hot *c) {
+    struct pg_pending *p = &c->cold->pend;
+    int slot = p->slot;
+    if (p->wq_owner) {
+        /* Defensive: a live link must never be linked again (double-link
+         * self-loops the intrusive list and hangs the completion poll in
+         * an infinite loop). Unlink first; the accounting count is
+         * unchanged (still exactly one waiter). */
+        waiter_unlink(p, slot);
+    } else if (p->wq_next || p->wq_prev) {
+        /* Stale pointers without an owner (should be unreachable under the
+         * del-before-free discipline): drop them, do not trust them. */
+        p->wq_next = NULL;
+        p->wq_prev = NULL;
+    }
+    p->wq_owner = c;
+    p->wq_prev = NULL;
+    p->wq_next = (slot >= 0 && slot < PG_NSLOTS) ? t_pg_qhead[slot] : NULL;
+    if (p->wq_next) p->wq_next->wq_prev = p;
+    if (slot >= 0 && slot < PG_NSLOTS) t_pg_qhead[slot] = p;
+}
+
+static inline void pg_waiter_add(struct conn_hot *c) {
+    int slot = c->cold->pend.slot;
+    if (slot >= 0 && slot < PG_NSLOTS) t_pg_waiters[slot]++;
+    waiter_link(c);
+}
+
+/* Completion/free path. Takes the saved (node, slot): http_resume's
+ * completion frees the stash, so callers must pass the pre-resume values.
+ * Unlink is idempotent (wq_owner NULLs on unlink). Node links are owned by
+ * the list and cleared only here -- never inside http_pending_free. */
+static inline void pg_waiter_del_node(struct pg_pending *pn, int slot) {
+    waiter_unlink(pn, slot);
     if (slot >= 0 && slot < PG_NSLOTS && t_pg_waiters[slot] > 0) t_pg_waiters[slot]--;
 }
 
@@ -180,22 +232,27 @@ static inline unsigned wheel_idx(time_t t) {
     return (unsigned)(t % WHEEL_N);
 }
 
-static inline void wheel_insert_at(struct conn_hot *c, unsigned s) {
-    c->next = t_wheel[s];
-    t_wheel[s] = c;
-    c->wheel_slot = (int)s;
+static inline struct conn_hot *wheel_head(unsigned s) {
+    return &t_wheel_head[s];
 }
 
-/* Unlink c from its wheel slot, if linked. No-op when wheel_slot == -1. */
+/* Linked iff wprev != NULL. Sentinels are never unlinked (discipline: only
+ * real conns pass through here). */
+static inline void wheel_insert_at(struct conn_hot *c, unsigned s) {
+    struct conn_hot *h = wheel_head(s);
+    c->next = h->next;
+    c->wprev = h;
+    h->next->wprev = c;
+    h->next = c;
+}
+
+/* Unlink c from its wheel slot, if linked. O(1). No-op when wprev == NULL. */
 static void wheel_unlink(struct conn_hot *c) {
-    int s = c->wheel_slot;
-    c->wheel_slot = -1;
-    if (s < 0 || s >= WHEEL_N) return;
-    struct conn_hot **pp = &t_wheel[s];
-    while (*pp) {
-        if (*pp == c) { *pp = c->next; return; }
-        pp = &(*pp)->next;
-    }
+    if (!c->wprev) return;
+    c->wprev->next = c->next;
+    c->next->wprev = c->wprev;
+    c->wprev = NULL;
+    c->next = NULL;
 }
 
 /* (Re)arm c's expiry for activity at time now. Steady-state conns expire at
@@ -211,10 +268,8 @@ static void wheel_rearm(struct conn_hot *c, time_t now) {
     else
         e = now + IDLE_S + 1;
     if (e <= now) e = now + 1;
-    unsigned s = wheel_idx(e);
-    if (c->wheel_slot == (int)s) return;
     wheel_unlink(c);
-    wheel_insert_at(c, s);
+    wheel_insert_at(c, wheel_idx(e));
 }
 
 static inline void tick_now(void) {
@@ -296,7 +351,7 @@ static void conn_free(struct conn_hot *c, int epfd) {
     if (cl) {
         free(cl->wbuf);
         if (c->state == CONN_PG_WAIT) {
-            pg_waiter_del(cl->pend.slot); /* sweep/close of a live waiter */
+            pg_waiter_del_node(&cl->pend, cl->pend.slot); /* sweep/close of a live waiter */
             http_pending_free(&cl->pend);
         }
     }
@@ -554,7 +609,16 @@ static void net_arm_pg(int slot) {
     ev.data.ptr = &t_w.pg_tags[slot];
     if (t_w.pg_armed[slot]) {
         if (t_w.pg_fd[slot] == fd) {
-            epoll_ctl(t_w.epfd, EPOLL_CTL_MOD, fd, &ev);
+            /* Greptile #7: MOD can hit ENOENT when the PG conn reconnected
+             * and the new socket reused the old fd number while the old
+             * registration lapsed (DEL of a replaced fd). Retry as ADD so
+             * the slot does not go silently unarmed. */
+            if (epoll_ctl(t_w.epfd, EPOLL_CTL_MOD, fd, &ev) != 0 &&
+                errno == ENOENT) {
+                if (epoll_ctl(t_w.epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+                    t_w.pg_fd[slot] = fd;
+                else { t_w.pg_armed[slot] = 0; t_w.pg_fd[slot] = -1; }
+            }
         } else {
             epoll_ctl(t_w.epfd, EPOLL_CTL_DEL, t_w.pg_fd[slot], NULL);
             if (epoll_ctl(t_w.epfd, EPOLL_CTL_ADD, fd, &ev) == 0) t_w.pg_fd[slot] = fd;
@@ -611,10 +675,19 @@ int net_arm_out(struct conn_hot *c) {
 }
 
 /* Best-effort drain of stashed response bytes. Returns 0 when drained (or
- * would-block: stays armed for the next EPOLLOUT), -1 on transport error. */
+ * would-block: stays armed for the next EPOLLOUT), -1 on transport error
+ * OR when a Connection:close stash just finished draining (Greptile #11:
+ * the close must happen only after the last byte is sent; callers treat -1
+ * as close). */
 static int drain_pending(struct conn_hot *c) {
     struct conn_cold *cl = c->cold;
     if (!cl->wbuf) {
+        if (cl->close_after_drain) {
+            /* Drained on an earlier event; the close verdict was deferred
+             * until the bytes were out. */
+            cl->close_after_drain = 0;
+            return -1;
+        }
         if (t_w.epfd >= 0) {
             struct epoll_event ev;
             ev.events = EPOLLIN;
@@ -638,6 +711,10 @@ static int drain_pending(struct conn_hot *c) {
     }
     free(cl->wbuf);
     cl->wbuf = NULL; cl->wlen = 0; cl->woff = 0;
+    if (cl->close_after_drain) {
+        cl->close_after_drain = 0;
+        return -1; /* stash fully sent: now close */
+    }
     if (t_w.epfd >= 0) {
         struct epoll_event ev;
         ev.events = EPOLLIN;
@@ -645,6 +722,32 @@ static int drain_pending(struct conn_hot *c) {
         epoll_ctl(t_w.epfd, EPOLL_CTL_MOD, c->fd, &ev);
     }
     return 0;
+}
+
+/* Greptile #8: pause client EPOLLIN while PG_WAIT. Level-triggered epoll
+ * re-reports an idle-but-armed client fd on every wait; the handler could
+ * only ignore it (state==CONN_PG_WAIT early-return), spinning the loop at
+ * 100% CPU while the DB works. MOD to no events on defer; restore EPOLLIN
+ * when the waiter resumes. Safe if the fd was already replaced/closed
+ * (MOD-ENOENT falls back to ADD; DEL is idempotent). */
+static void client_pause(struct conn_hot *c) {
+    if (t_w.epfd < 0) return;
+    struct epoll_event ev;
+    ev.events = 0;
+    ev.data.ptr = c;
+    epoll_ctl(t_w.epfd, EPOLL_CTL_MOD, c->fd, &ev);
+}
+
+static void client_resume(struct conn_hot *c) {
+    if (t_w.epfd < 0) return;
+    struct epoll_event ev;
+    /* Restore EPOLLIN; keep EPOLLOUT if a response stash is still draining
+     * (Greptile #11: dropping OUT here would strand the stash with no
+     * wakeup left to finish it). */
+    ev.events = EPOLLIN | (c->cold->wbuf ? (uint32_t)EPOLLOUT : 0u);
+    ev.data.ptr = c;
+    if (epoll_ctl(t_w.epfd, EPOLL_CTL_MOD, c->fd, &ev) != 0 && errno == ENOENT)
+        epoll_ctl(t_w.epfd, EPOLL_CTL_ADD, c->fd, &ev);
 }
 
 /* Box pbuf bytes [b, b+n) into the conn slab (slow-path entry). Grows
@@ -708,10 +811,11 @@ static int handle_data(struct conn_hot *c) {
     long up = current_uptime_s();
     int ka = http_respond(c, &rq, up);
     c->last_active = t_w.cached_wall;
-    wheel_rearm(c, t_w.cached_wall); /* O(1) same-slot; relink on 1s roll */
+    wheel_rearm(c, t_w.cached_wall);
     if (ka == HTTP_DEFERRED) {
-        pg_waiter_add(c->cold->pend.slot); /* new waiter enters PG_WAIT */
+        pg_waiter_add(c); /* new waiter enters PG_WAIT (count + list) */
         net_arm_pg(c->cold->pend.slot);
+        client_pause(c); /* Greptile #8: no EPOLLIN spin while PG_WAIT */
         return 1; /* keep waiting; resume on PG readiness */
     }
     if (c->cold->wbuf) return 1; /* EAGAIN stash: wait for EPOLLOUT */
@@ -733,6 +837,7 @@ static int handle_data_boxed(struct conn_hot *c) {
     }
     /* Grow slab if needed (lazy: first bytes allocate SLAB_INIT).
      * Pass 10: pooled 64B-aligned size classes; old slab recycles. */
+    int eof = 0; /* peer FIN seen: parse buffered completes before closing */
     while (1) {
         if (c->rlen == c->rcap) {
             unsigned int ncap = c->rcap ? c->rcap * 2 : SLAB_INIT;
@@ -753,7 +858,11 @@ static int handle_data_boxed(struct conn_hot *c) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             return 0;
         }
-        if (r == 0) return 0; /* peer closed */
+        /* Greptile #9: a FIN (shutdown WR) with pipelined bytes buffered
+         * must not drop the buffered completes. Mark EOF, fall into the
+         * parse loop below, and close only when no complete request
+         * remains (need-more or drained with EOF set). */
+        if (r == 0) { eof = 1; break; }
         c->rlen += (unsigned int)r;
         if (c->rlen > HDR_CAP + BODY_CAP) return 0;
         break;
@@ -763,7 +872,14 @@ static int handle_data_boxed(struct conn_hot *c) {
         http_req_t rq;
         int n = http_parse(c->rbuf, c->rlen, &rq);
         if (n == 0) {
-            if (c->rlen > HDR_CAP) return 0; /* header cap 16K */
+            /* Greptile #10: the 16K cap applies to the header alone, not
+             * header+buffered-body. When the header terminator is present
+             * we are only waiting for body bytes (total cap enforced by
+             * the slab); only a terminator-less buffer past HDR_CAP is a
+             * header-cap violation. */
+            if (!memmem(c->rbuf, c->rlen, "\r\n\r\n", 4) && c->rlen > HDR_CAP)
+                return 0; /* header cap 16K */
+            if (eof) return 0; /* FIN: nothing complete left */
             if (c->req_count == 0 && c->rlen > 0)
                 wheel_rearm(c, t_w.cached_wall); /* header-stall expiry */
             break; /* need more */
@@ -778,10 +894,11 @@ static int handle_data_boxed(struct conn_hot *c) {
         if (consumed < c->rlen) memmove(c->rbuf, c->rbuf + consumed, c->rlen - consumed);
         c->rlen -= (unsigned int)consumed;
         c->last_active = t_w.cached_wall;
-        wheel_rearm(c, t_w.cached_wall); /* O(1) same-slot; relink on 1s roll */
+        wheel_rearm(c, t_w.cached_wall);
         if (ka == HTTP_DEFERRED) {
-            pg_waiter_add(c->cold->pend.slot); /* new waiter enters PG_WAIT */
+            pg_waiter_add(c); /* new waiter enters PG_WAIT (count + list) */
             net_arm_pg(c->cold->pend.slot);
+            client_pause(c); /* Greptile #8: no EPOLLIN spin while PG_WAIT */
             return 1; /* keep waiting; resume on PG readiness */
         }
         if (c->cold->wbuf) return 1; /* EAGAIN stash: wait for EPOLLOUT */
@@ -789,16 +906,18 @@ static int handle_data_boxed(struct conn_hot *c) {
         if (c->req_count >= MAX_REQS) return 0; /* close after 1000 reqs */
         /* loop for pipelined next request */
     }
+    if (eof) return 0; /* peer went away and the buffer is drained */
     slab_maybe_shrink(c);
     return 1;
 }
 
 /* c just finished its PG wait (state ACTIVE, stash already freed).
  * r is http_resume's verdict (1 keep / 0 close). Frees c when closing
- * (wheel_unlink happens inside conn_free), else rearms the idle expiry
- * and drains pipelined data buffered while waiting.
- * Returns 1 when c was freed, 0 when c stays. Callers iterate the wheel
- * with a saved-next pattern, so c may move slots or die underneath. */
+ * (wheel_unlink happens inside conn_free), else restores client EPOLLIN
+ * (paused during PG_WAIT, Greptile #8), rearms the idle expiry and drains
+ * pipelined data buffered while waiting.
+ * Returns 1 when c was freed, 0 when c stays. Callers iterate waiter lists
+ * with a saved-next pattern, so c may die underneath. */
 static int finish_completed(struct conn_hot *c, int r) {
     c->last_active = t_w.cached_wall;
     wheel_rearm(c, t_w.cached_wall);
@@ -806,6 +925,7 @@ static int finish_completed(struct conn_hot *c, int r) {
         conn_free(c, t_w.epfd);
         return 1;
     }
+    client_resume(c); /* PG_WAIT pause ends before any client recv */
     int alive = handle_data(c);
     if (c->state == CONN_PG_WAIT) {
         net_arm_pg(c->cold->pend.slot);
@@ -823,36 +943,36 @@ static int finish_completed(struct conn_hot *c, int r) {
  * pipelined data is drained inline.
  * Multi-pass: a completion frees the slot, so queued (sent==0) waiters are
  * retried in the same event instead of stalling for a future wakeup.
- * Pass 11: iterates the timing wheel with a saved-next pattern -- resume
- * may rearm (move slots) or close c underneath us, so no slot pointer is
- * held across the call. */
+ * Pass 19 (Greptile #12): iterates the slot's intrusive waiter list with a
+ * saved-next pattern -- resume may free c underneath us, and a resumed
+ * keep-alive may defer a NEW waiter (head insert: safe under saved-next),
+ * but no wheel slot pointer is held across the call. Completion is
+ * O(waiters on this slot), not O(all conns). */
 /* Poll all waiters bound to PG slot with sent==want_sent. Progress shares
- * the old pp-loop semantics exactly: a completion (freed or resumed) or a
- * queued->in-flight advance counts. Saved-next iteration because resume may
- * rearm (move wheel slots) or close c underneath us. */
+ * the old loop semantics exactly: a completion (freed or resumed) or a
+ * queued->in-flight advance counts. */
 static int wheel_poll_waiters(int slot, int want_sent) {
     if (slot < 0 || slot >= PG_NSLOTS || t_pg_waiters[slot] == 0) return 0; /* O(1) skip */
     int progress = 0;
-    for (int w = 0; w < WHEEL_N; w++) {
-        struct conn_hot *c = t_wheel[w];
-        while (c) {
-            struct conn_hot *nx = c->next; /* resume may relink/free c */
-            if (c->state == CONN_PG_WAIT && c->cold->pend.slot == slot &&
-                (c->cold->pend.sent == want_sent)) {
-                int was_sent = c->cold->pend.sent;
-                int wslot = c->cold->pend.slot; /* resume frees the stash */
-                int r = http_resume(c);
-                if (r == HTTP_DEFERRED) {
-                    if (c->cold->pend.sent != was_sent) progress = 1; /* queued -> in flight */
-                    net_arm_pg(slot);
-                } else {
-                    pg_waiter_del(wslot); /* waiter completed */
-                    progress = 1;
-                    finish_completed(c, r);
-                }
+    struct pg_pending *pn = t_pg_qhead[slot];
+    while (pn) {
+        struct pg_pending *wn = pn->wq_next; /* resume may free c */
+        struct conn_hot *c = pn->wq_owner;
+        if (c && c->state == CONN_PG_WAIT && c->cold->pend.slot == slot &&
+            pn == &c->cold->pend && pn->sent == want_sent) {
+            int was_sent = pn->sent;
+            int wslot = pn->slot; /* resume frees the stash: save first */
+            int r = http_resume(c);
+            if (r == HTTP_DEFERRED) {
+                if (pn->sent != was_sent) progress = 1; /* queued -> in flight */
+                net_arm_pg(slot);
+            } else {
+                pg_waiter_del_node(pn, wslot); /* waiter completed */
+                progress = 1;
+                finish_completed(c, r);
             }
-            c = nx;
         }
+        pn = wn;
     }
     return progress;
 }
@@ -872,24 +992,23 @@ static void handle_pg_ready_one(int slot) {
      * send yields result data (POLLIN), a BUSY verdict means someone is in
      * flight whose completion will fire. */
     if (slot >= 0 && slot < PG_NSLOTS && t_pg_waiters[slot] > 0) {
-        int done = 0;
-        for (int w = 0; w < WHEEL_N && !done; w++) {
-            struct conn_hot *c = t_wheel[w];
-            while (c && !done) {
-                struct conn_hot *nx = c->next;
-                if (c->state == CONN_PG_WAIT && c->cold->pend.slot == slot && !c->cold->pend.sent) {
-                    int wslot = c->cold->pend.slot; /* resume frees the stash */
-                    int r = http_resume(c);
-                    if (r == HTTP_DEFERRED) {
-                        net_arm_pg(slot);
-                    } else {
-                        pg_waiter_del(wslot); /* waiter completed */
-                        finish_completed(c, r);
-                    }
-                    done = 1;
+        struct pg_pending *pn = t_pg_qhead[slot];
+        while (pn) {
+            struct pg_pending *wn = pn->wq_next;
+            struct conn_hot *c = pn->wq_owner;
+            if (c && c->state == CONN_PG_WAIT && pn == &c->cold->pend &&
+                c->cold->pend.slot == slot && !pn->sent) {
+                int wslot = pn->slot;
+                int r = http_resume(c);
+                if (r == HTTP_DEFERRED) {
+                    net_arm_pg(slot);
+                } else {
+                    pg_waiter_del_node(pn, wslot); /* waiter completed */
+                    finish_completed(c, r);
                 }
-                c = nx;
+                break;
             }
+            pn = wn;
         }
     }
     net_gc_pg();
@@ -909,25 +1028,25 @@ static int wheel_poll_reads_packed(int want_sent) {
     }
     if (!any) return 0;
     int progress = 0;
-    for (int w = 0; w < WHEEL_N; w++) {
-        struct conn_hot *c = t_wheel[w];
-        while (c) {
-            struct conn_hot *nx = c->next; /* resume may relink/free c */
-            if (c->state == CONN_PG_WAIT && c->cold->pend.slot < PG_R_NSLOTS &&
-                (c->cold->pend.sent == want_sent)) {
-                int was_sent = c->cold->pend.sent;
-                int wslot = c->cold->pend.slot;
+    for (int q = 0; q < PG_R_NSLOTS; q++) {
+        struct pg_pending *pn = t_pg_qhead[q];
+        while (pn) {
+            struct pg_pending *wn = pn->wq_next; /* resume may free c */
+            struct conn_hot *c = pn->wq_owner;
+            if (c && c->state == CONN_PG_WAIT && pn == &c->cold->pend &&
+                c->cold->pend.slot == q && pn->sent == want_sent) {
+                int was_sent = pn->sent;
                 int r = http_resume(c);
                 if (r == HTTP_DEFERRED) {
-                    if (c->cold->pend.sent != was_sent) progress = 1;
-                    net_arm_pg(wslot);
+                    if (pn->sent != was_sent) progress = 1;
+                    net_arm_pg(q);
                 } else {
-                    pg_waiter_del(wslot);
+                    pg_waiter_del_node(pn, q);
                     progress = 1;
                     finish_completed(c, r);
                 }
             }
-            c = nx;
+            pn = wn;
         }
     }
     return progress;
@@ -947,23 +1066,23 @@ static void handle_pg_ready(int slot) {
          * stall (socket idle, no POLLIN ahead). Retry one optimistically. */
         {
             int done = 0;
-            for (int w = 0; w < WHEEL_N && !done; w++) {
-                struct conn_hot *c = t_wheel[w];
-                while (c && !done) {
-                    struct conn_hot *nx = c->next;
-                    if (c->state == CONN_PG_WAIT &&
-                        c->cold->pend.slot < PG_R_NSLOTS && !c->cold->pend.sent) {
-                        int wslot = c->cold->pend.slot;
+            for (int q = 0; q < PG_R_NSLOTS && !done; q++) {
+                struct pg_pending *pn = t_pg_qhead[q];
+                while (pn && !done) {
+                    struct pg_pending *wn = pn->wq_next;
+                    struct conn_hot *c = pn->wq_owner;
+                    if (c && c->state == CONN_PG_WAIT && pn == &c->cold->pend &&
+                        c->cold->pend.slot == q && !pn->sent) {
                         int r = http_resume(c);
                         if (r == HTTP_DEFERRED) {
-                            net_arm_pg(wslot);
+                            net_arm_pg(q);
                         } else {
-                            pg_waiter_del(wslot);
+                            pg_waiter_del_node(pn, q);
                             finish_completed(c, r);
                         }
                         done = 1;
                     }
-                    c = nx;
+                    pn = wn;
                 }
             }
         }
@@ -996,6 +1115,12 @@ void *worker_main(void *arg) {
         t_w.pg_armed[i] = 0;
         t_w.pg_fd[i] = -1;
         t_pg_waiters[i] = 0;
+        t_pg_qhead[i] = NULL;
+    }
+    /* Pass 19: init timing-wheel sentinels (each head self-linked). */
+    for (int i = 0; i < WHEEL_N; i++) {
+        t_wheel_head[i].next = &t_wheel_head[i];
+        t_wheel_head[i].wprev = &t_wheel_head[i];
     }
     if (idx == 0)
         fprintf(stderr, "conn_hot size=%zu align=%zu cold=%zu\n",
@@ -1097,34 +1222,24 @@ void *worker_main(void *arg) {
             time_t t0 = last_sweep;
             last_sweep = now;
             for (time_t t = t0 + 1; t <= now; t++) {
-                struct conn_hot **pp = &t_wheel[wheel_idx(t)];
-                while (*pp) {
-                    struct conn_hot *c = *pp;
+                struct conn_hot *h = wheel_head(wheel_idx(t));
+                struct conn_hot *c = h->next;
+                while (c != h) {
+                    struct conn_hot *nx = c->next; /* conn_free unlinks c */
                     /* Prefetch the expiry burst ahead; closes dominate and
                      * survivors are near-zero under exact scheduling. */
-                    struct conn_hot *nx = c->next;
-                    if (nx) __builtin_prefetch(nx, 0, 3);
+                    if (nx != h) __builtin_prefetch(nx, 0, 3);
                     __builtin_prefetch(c->cold, 0, 3);
                     if (t - c->last_active > IDLE_S ||
                         (c->req_count == 0 && c->rlen > 0 && t - c->cold->created_at > HDR_TIMEOUT_S)) {
-                        *pp = c->next;
-                        c->wheel_slot = -1; /* conn_free unlink becomes no-op */
-                        conn_free(c, epfd);
+                        conn_free(c, epfd); /* unlinks from the wheel */
                     } else {
-                        /* Not due: re-place defensively (unreachable under
-                         * exact scheduling; keeps the invariant airtight). */
-                        time_t e2;
-                        if (c->req_count == 0 && c->rlen > 0)
-                            e2 = c->cold->created_at + HDR_TIMEOUT_S + 1;
-                        else
-                            e2 = c->last_active + IDLE_S + 1;
-                        if (e2 <= t) e2 = t + 1;
-                        unsigned s2 = wheel_idx(e2);
-                        if (s2 != wheel_idx(t)) {
-                            *pp = c->next;
-                            wheel_insert_at(c, s2);
-                        } else { slab_maybe_shrink(c); pp = &c->next; }
+                        /* Not due (unreachable under exact scheduling:
+                         * placement is always exact, so the conn is already
+                         * home); just shrink oversized idle slabs. */
+                        slab_maybe_shrink(c);
                     }
+                    c = nx;
                 }
             }
             net_gc_pg();
@@ -1172,6 +1287,20 @@ void *worker_main(void *arg) {
                 }
             } else {
                 struct conn_hot *c = (struct conn_hot *)ptr;
+                /* Pass 19 (Greptile #8): a hung-up/errored fd with no
+                 * readable data is dead -- close it immediately instead of
+                 * spinning the level-triggered HUP/ERR (this fires even on
+                 * EPOLLIN-paused PG_WAIT fds). With EPOLLIN also set, fall
+                 * through to handle_data so buffered pipelined bytes (FIN
+                 * after data, Greptile #9) are parsed before any EOF close.
+                 * conn_free unlinks a live PG_WAIT waiter, so the slot is
+                 * reclaimable by the ownership-gate heal. */
+                if ((events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) &&
+                    !(events[i].events & EPOLLIN)) {
+                    conn_free(c, epfd); /* unlinks from the wheel internally */
+                    net_gc_pg();
+                    continue;
+                }
                 /* Pass 12 O(1) guard: a PG event earlier in this batch (or
                  * the sweep just above) may have freed c. Membership in the
                  * per-tick closed-set is O(batch); overflow falls back to
@@ -1180,7 +1309,8 @@ void *worker_main(void *arg) {
                 if (t_closed_overflow) {
                     dead = 1;
                     for (int w = 0; w < WHEEL_N && dead; w++) {
-                        for (struct conn_hot *x = t_wheel[w]; x; x = x->next) {
+                        struct conn_hot *h = wheel_head((unsigned)w);
+                        for (struct conn_hot *x = h->next; x != h; x = x->next) {
                             if (x == c) { dead = 0; break; }
                         }
                     }

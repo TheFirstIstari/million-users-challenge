@@ -17,6 +17,8 @@ enum {
     PG_ROUTE_LIKE = 5
 };
 
+struct conn_hot; /* waiter back-pointer below */
+
 struct pg_pending {
     int route;                 /* one of PG_ROUTE_* */
     int slot;                  /* claimed PG slot */
@@ -32,6 +34,16 @@ struct pg_pending {
     size_t conn_hdr_len;
     long uptime_s;
     int accept_gzip;           /* client Accept-Encoding: gzip (preserved across PG_WAIT) */
+    /* Pass 19: slot ownership + waiter-list linkage (Greptile #12/#13).
+     * pg_gen pairs with pg.c's per-slot (owner, gen): only the owner that
+     * claimed the slot may poll/consume its result, so a recycled slot can
+     * never cross-wire a foreign result (the 404 class). wq_* intrusively
+     * links this waiter into its slot's DB waiter list for O(waiters)
+     * completion instead of the O(128 slots) wheel scan. */
+    unsigned pg_gen;           /* claim generation (never 0 while linked) */
+    struct conn_hot *wq_owner; /* owning conn, NULL when unlinked */
+    struct pg_pending *wq_next;
+    struct pg_pending *wq_prev;
 };
 
 /* Pass 10: hot/cold conn split. The per-request hot path touches ONLY
@@ -46,6 +58,7 @@ struct conn_cold {
     char *wbuf;                /* cold: stashed unsent response bytes (EAGAIN) */
     size_t wlen;               /* cold: total stashed */
     size_t woff;               /* cold: already sent */
+    int close_after_drain;     /* cold: Connection:close stashed EAGAIN: close only after last byte drains */
     struct pg_pending pend;    /* cold: valid only when state == CONN_PG_WAIT */
 };
 
@@ -57,9 +70,9 @@ struct __attribute__((aligned(64))) conn_hot {
     unsigned int rlen;         /* hot: buffered bytes */
     unsigned int rcap;         /* hot: slab class size */
     struct conn_hot *next;     /* hot: timing-wheel slot link (intrusive, Pass 11) */
+    struct conn_hot *wprev;    /* hot: wheel doubly-linked prev (Pass 19: O(1) unlink, Greptile #6) */
     int keep_alive;            /* hot: response verdict cache */
     int state;                 /* hot: CONN_ACTIVE or CONN_PG_WAIT */
-    int wheel_slot;            /* hot: wheel slot index (-1 = unlinked) */
     struct conn_cold *cold;    /* hot: one chase to rare state (cold-only) */
 };
 _Static_assert(sizeof(struct conn_hot) <= 64, "conn hot must be <=64B");

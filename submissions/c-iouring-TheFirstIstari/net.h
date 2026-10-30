@@ -46,6 +46,9 @@ struct pg_pending {
     struct pg_pending *wq_prev;
 };
 
+/* Pass 20: no-multishot-slot sentinel (cold->mslot when no recv is armed). */
+#define MSHOT_NO_SLOT ((unsigned)-1)
+
 /* Pass 10: hot/cold conn split. The per-request hot path touches ONLY
  * struct conn_hot (one 64B cache line). Everything rare -- creation time,
  * EAGAIN stash, PG_WAIT stash -- lives in struct conn_cold, allocated
@@ -59,6 +62,12 @@ struct conn_cold {
     size_t wlen;               /* cold: total stashed */
     size_t woff;               /* cold: already sent */
     int close_after_drain;     /* cold: Connection:close stashed EAGAIN: close only after last byte drains */
+    /* Pass 20: multishot recv slot + generation. mgen pairs with the
+     * user_data high word so a recycled slot never cross-wires a stale CQE;
+     * mshot_eof latches a FIN CQE so the resume path closes promptly. */
+    unsigned mslot;              /* recv-table slot, or MSHOT_NO_SLOT */
+    unsigned mgen;               /* generation armed in this slot */
+    int mshot_eof;               /* FIN CQE seen (multishot ended) */
     struct pg_pending pend;    /* cold: valid only when state == CONN_PG_WAIT */
 };
 
@@ -86,6 +95,9 @@ int net_arm_out(struct conn_hot *c);
  * defer path fail fast instead of queueing without bound when the whole
  * pool is saturated (overload fail-safe; steady state never approaches it). */
 int net_waiter_count(int slot);
+/* Pass 21: total live PG_WAIT waiters on this worker (O(1)). Bounds the
+ * summed intrusive lists to PG_WAIT_MAX; see http_defer. */
+int net_waiter_total(void);
 /* 1s-tick-cached wall clock for this worker (no time() per request). */
 time_t net_now_wall(void);
 

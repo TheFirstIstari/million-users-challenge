@@ -310,30 +310,74 @@ static char *append_u64(char *p, size_t v) {
     return p;
 }
 
-/* ---- Pass 7: feed-first gzip (level 1, gzip framing);
- * Pass 15: vendored libdeflate L1 replaces system zlib. ---- */
+/* ---- Pass 7: feed-first gzip (gzip framing);
+ * Pass 15: vendored libdeflate L1 replaces system zlib.
+ * Pass 22: dual auto-tier L0 (store) + L1 per thread. Routing is by size
+ * only, never by route: ilen >= GZIP_L0_THRESH (large feeds, CPU-bound at
+ * ~28% on-CPU gzip) takes L0 at ~1/3 the CPU for a worse ratio; smaller
+ * bodies keep L1 (best ratio, network matters, small CPU either way).
+ * Single posts never reach gzip (<=650 B < GZIP_MIN_POST), so in practice
+ * the dual tier only affects the feed. Every request with AE compresses
+ * fresh (no memoization across writes, Rule 7); the tier choice never
+ * skips gzip, it only picks the level. Any failure falls back to identity
+ * in the caller, byte-exact. ---- */
 
 #define GZIP_MIN_POST 1024
-/* Worst-case input is t_feed (128 KiB); keep 136 KiB of thread-local room.
- * libdeflate_gzip_compress() returns 0 when the output does not fit, and the
- * worst-case gzip expansion of 128 KiB stays well under GZ_CAP, so any 0
- * falls through to identity in the caller. */
+/* Pass 22: feed bodies run 3-5 KiB typical; >= 4 KiB goes L0 (store). */
+#define GZIP_L0_THRESH 4096
+/* Worst-case gzip input is t_feed (128 KiB, pg.c); the slab below is
+ * pre-sized once per level from libdeflate_gzip_compress_bound() for that
+ * class and then reused every request (no per-request sizing). */
+#define GZ_MAX_IN 131072
+/* Worst-case gzip expansion of 128 KiB stays well under GZ_CAP for both
+ * levels, so a 0 return (output did not fit) falls through to identity. */
 #define GZ_CAP 139264
 
-static _Thread_local struct libdeflate_compressor *t_ldc = NULL;
+static _Thread_local struct libdeflate_compressor *t_ldc_l1 = NULL;
+static _Thread_local struct libdeflate_compressor *t_ldc_l0 = NULL;
 static _Thread_local unsigned char t_gz[GZ_CAP];
+/* Worst-case bounds sampled once per level (0 = not sampled yet). */
+static _Thread_local size_t t_gz_bound_l1 = 0;
+static _Thread_local size_t t_gz_bound_l0 = 0;
+
+/* Pick the tier compressor for ilen, allocating lazily once per thread.
+ * Returns NULL only when that tier's allocator fails (caller tries the
+ * other tier, then identity). Never returns NULL for both when malloc
+ * works: L1 alloc failure with L0 already live still serves via L0. */
+static struct libdeflate_compressor *gzip_comp_for(size_t ilen) {
+    if (ilen >= GZIP_L0_THRESH) {
+        if (unlikely(t_ldc_l0 == NULL)) {
+            t_ldc_l0 = libdeflate_alloc_compressor(0);
+            if (t_ldc_l0 != NULL)
+                t_gz_bound_l0 = libdeflate_gzip_compress_bound(t_ldc_l0, GZ_MAX_IN);
+        }
+        if (t_ldc_l0 != NULL)
+            return t_ldc_l0;
+    }
+    if (unlikely(t_ldc_l1 == NULL)) {
+        t_ldc_l1 = libdeflate_alloc_compressor(1);
+        if (t_ldc_l1 != NULL)
+            t_gz_bound_l1 = libdeflate_gzip_compress_bound(t_ldc_l1, GZ_MAX_IN);
+    }
+    return t_ldc_l1;
+}
 
 /* Compress in[0..ilen) into thread-local t_gz. 0 ok (out+olen set), -1 on
  * failure (caller falls back to identity, byte-exact). No per-request malloc:
- * one level-1 compressor per thread, allocated once and reused. */
+ * two compressors (L0+L1) per thread, allocated once and reused; the slab
+ * is bounds-checked against the once-sampled worst case for its tier. */
 static int gzip_compress(const char *in, size_t ilen,
                          const unsigned char **out, size_t *olen) {
-    if (unlikely(t_ldc == NULL)) {
-        t_ldc = libdeflate_alloc_compressor(1);
-        if (t_ldc == NULL)
-            return -1;
-    }
-    size_t n = libdeflate_gzip_compress(t_ldc, in, ilen, t_gz, sizeof t_gz);
+    struct libdeflate_compressor *c = gzip_comp_for(ilen);
+    if (c == NULL)
+        return -1;
+    size_t bound = (c == t_ldc_l0) ? t_gz_bound_l0 : t_gz_bound_l1;
+    /* Fail closed to identity when the input exceeds the pre-sized class
+     * or the tier bound does not fit the slab (defensive; neither fires:
+     * feed input caps at GZ_MAX_IN and both bounds sit well under GZ_CAP). */
+    if (unlikely(ilen > GZ_MAX_IN || bound == 0 || bound > sizeof t_gz))
+        return -1;
+    size_t n = libdeflate_gzip_compress(c, in, ilen, t_gz, sizeof t_gz);
     if (n == 0)
         return -1;
     *out = t_gz;
@@ -714,6 +758,12 @@ static const char *stmt_for_route(int route) {
  * 500/503) instead of queueing without bound. Pure overload behavior;
  * normal-path verdicts are unchanged. */
 #define PG_WAIT_MAX_PER_SLOT 4096
+/* Pass 21: total live PG_WAIT waiters per worker. The per-slot bound above
+ * allows 32x4096 in theory; this caps the summed intrusive-list length so
+ * every completion stays O(actual waiters) with a hard 4096 ceiling.
+ * Steady state holds single digits per slot, so normal-path verdicts are
+ * unchanged; only true pool saturation fails fast here. */
+#define PG_WAIT_MAX 4096
 
 /* Stash the request for PG_WAIT and kick the async send.
  * Returns HTTP_DEFERRED when stashed (caller must arm the PG socket and
@@ -741,7 +791,8 @@ static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
      * Each write is committed before its response (autocommit); no
      * shared-txn group commit. */
     int slot = pg_claim_slot_for_route(route);
-    if (slot < 0 || slot >= PG_POOL_N || net_waiter_count(slot) >= PG_WAIT_MAX_PER_SLOT) {
+    if (slot < 0 || slot >= PG_POOL_N || net_waiter_count(slot) >= PG_WAIT_MAX_PER_SLOT ||
+        net_waiter_total() >= PG_WAIT_MAX) {
         free(cp0); free(cp1); free(ca); free(ch);
         return -1;
     }

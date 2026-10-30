@@ -75,3 +75,10 @@ clean:
 	rm -f $(TARGET) $(OBJS) *.gcda *.gcno
 
 .PHONY: all clean pgo
+
+# Pass 20: `make USE_EPOLL_RECV=1` forces the epoll recv path (bisection or
+# kernels without RECV_MULTISHOT). Default is multishot recv with the epoll
+# path kept as the runtime fallback. Both paths stay compiled either way.
+ifdef USE_EPOLL_RECV
+CFLAGS += -DUSE_EPOLL_RECV
+endif

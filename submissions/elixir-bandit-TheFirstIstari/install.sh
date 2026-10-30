@@ -35,9 +35,9 @@ elif command -v apt-get >/dev/null 2>&1; then
       erl -eval 'erlang:display(erlang:system_info(otp_release)), halt().' -noshell >&2 || true
       exit 1
     fi
-    tmp_zip="$(mktemp /tmp/elixir-fallback_XXXXXX.zip)"
+    tmp_dir="$(mktemp -d /tmp/elixir-fallback_XXXXXX)"
+    tmp_zip="$tmp_dir/elixir-fallback.zip"
     for attempt in 1 2 3; do
-      rm -f "$tmp_zip"
       if wget --tries=3 --timeout=30 -O "$tmp_zip" "$ELIXIR_FALLBACK_URL" && [ -s "$tmp_zip" ]; then
         break
       fi
@@ -46,11 +46,11 @@ elif command -v apt-get >/dev/null 2>&1; then
     done
     if [ ! -s "$tmp_zip" ]; then
       echo "FATAL: could not download pinned Elixir ${ELIXIR_FALLBACK_VSN} fallback from ${ELIXIR_FALLBACK_URL}" >&2
-      rm -f "$tmp_zip"
+      rm -rf "$tmp_dir"
       exit 1
     fi
     unzip -o "$tmp_zip" -d /usr/local
-    rm -f "$tmp_zip"
+    rm -rf "$tmp_dir"
     hash -r || true
   fi
 else

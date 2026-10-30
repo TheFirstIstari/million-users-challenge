@@ -15,6 +15,25 @@ defmodule Feed.Auth do
     end
   end
   defp verify_parts(hb64, pb64, sb64, secret) when hb64 == @header_b64 do
+    verify_sig_claims(hb64, pb64, sb64, secret)
+  end
+  defp verify_parts(hb64, pb64, sb64, secret) do
+    if header_hs256?(hb64) do
+      verify_sig_claims(hb64, pb64, sb64, secret)
+    else
+      {:error, :invalid}
+    end
+  end
+  defp header_hs256?(hb64) do
+    with {:ok, hjson} <- Base.url_decode64(hb64, padding: false),
+         {:ok, header} <- Jason.decode(hjson),
+         true <- is_map(header) and header["alg"] == "HS256" do
+      true
+    else
+      _ -> false
+    end
+  end
+  defp verify_sig_claims(hb64, pb64, sb64, secret) do
     with signing = hb64 <> "." <> pb64,
          {:ok, sig} <- b64decode(sb64),
          true <- sig_ok?(signing, sig, secret),
@@ -27,7 +46,6 @@ defmodule Feed.Auth do
       _ -> {:error, :invalid}
     end
   end
-  defp verify_parts(_, _, _, _), do: {:error, :invalid}
   defp b64decode(s) do
     case Base.url_decode64(s, padding: false) do
       {:ok, b} -> {:ok, b}
@@ -54,6 +72,8 @@ defmodule Feed.Auth do
       _ -> {:error, :payload}
     end
   end
+  defp check_claims(%{"sub" => _, "username" => uname, "exp" => _}) when not is_binary(uname),
+    do: {:error, :payload}
   defp check_claims(%{"sub" => _, "username" => _}), do: {:error, :invalid}
   defp check_claims(_), do: {:error, :payload}
   defp parse_sub(s) when is_binary(s) do

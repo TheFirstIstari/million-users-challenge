@@ -277,6 +277,11 @@ static inline void tick_now(void) {
     time(&t_w.cached_wall);
 }
 
+int net_waiter_count(int slot) {
+    if (slot < 0 || slot >= PG_NSLOTS) return 0;
+    return t_pg_waiters[slot];
+}
+
 time_t net_now_wall(void) {
     return t_w.cached_wall;
 }
@@ -1102,13 +1107,16 @@ void *worker_main(void *arg) {
         fprintf(stderr, "worker %ld: bind %s:%d/%d failed: %s\n", idx, g_host, g_port, g_extra_port, strerror(errno));
         if (l1 >= 0) close(l1);
         if (l2 >= 0) close(l2);
-        exit(1);
+        /* Overload hardening: never exit() the process from a worker
+         * thread (that kills healthy workers mid-bench). Report via the
+         * thread return; main converts any failure to exit code 1. */
+        return (void *)1;
     }
 
     pg_init_thread(g_db_url[0] ? g_db_url : NULL);
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0) { perror("epoll_create1"); exit(1); }
+    if (epfd < 0) { perror("epoll_create1"); return (void *)1; }
     t_w.epfd = epfd;
     for (int i = 0; i < PG_NSLOTS; i++) {
         t_w.pg_tags[i].slot = i;
@@ -1176,7 +1184,7 @@ void *worker_main(void *arg) {
      * stash, pipelining order -- needs its own pass). */
     if (pbuf_init() != 0) {
         fprintf(stderr, "worker %ld: pbuf ring alloc failed\n", idx);
-        exit(1);
+        return (void *)1;
     }
     int recv_mshot = 0;
     if (have_uring && pbuf_provide(&ring) == 0) {

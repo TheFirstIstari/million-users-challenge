@@ -82,6 +82,10 @@ void *worker_main(void *arg);
 
 /* Re-arm a conn for EPOLLOUT (unsent response pending). 0 ok, -1 on error. */
 int net_arm_out(struct conn_hot *c);
+/* Live PG_WAIT waiter count on this worker's PG slot (O(1)). Lets the HTTP
+ * defer path fail fast instead of queueing without bound when the whole
+ * pool is saturated (overload fail-safe; steady state never approaches it). */
+int net_waiter_count(int slot);
 /* 1s-tick-cached wall clock for this worker (no time() per request). */
 time_t net_now_wall(void);
 

@@ -2,6 +2,7 @@
 #include "jwt.h"
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,19 @@ int main(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n < 1) n = 1;
     if (n > 16) n = 16;
+    /* Overload hardening: sysconf ignores taskset/cpuset/container quotas,
+     * so a constrained box would overspawn workers (16 workers x 128k cap =
+     * 2M fds on a 4-core box, and 512 PG conns). Clamp to the calling
+     * thread's affinity when it is narrower; a no-op on unconstrained rigs
+     * (affinity == online count). */
+    {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof set, &set) == 0) {
+            int k = CPU_COUNT(&set);
+            if (k >= 1 && (long)k < n) n = k;
+        }
+    }
     fprintf(stderr, "server: %ld workers on %s:%d+%d (liburing probe, epoll fallback)\n",
         n, g_host, g_port, g_extra_port);
 
@@ -79,8 +93,18 @@ int main(void) {
             return 1;
         }
     }
-    for (long i = 0; i < n; i++) pthread_join(th[i], NULL);
-    return 0;
+    int rc = 0;
+    for (long i = 0; i < n; i++) {
+        void *rv = NULL;
+        pthread_join(th[i], &rv);
+        /* A worker returns non-NULL only on fatal startup failure (bind /
+         * epoll / pbuf ring); it never calls exit() itself, so one worker's
+         * bad config can no longer SIGKILL the healthy ones mid-overload.
+         * The process still reports failure via the exit code. */
+        if (rv != NULL) rc = 1;
+    }
+    free(th);
+    return rc;
 }
 
 const char *jwt_secret(void) {

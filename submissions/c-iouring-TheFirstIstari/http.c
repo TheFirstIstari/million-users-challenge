@@ -705,10 +705,21 @@ static const char *stmt_for_route(int route) {
     }
 }
 
+/* Overload fail-safe: max queued+in-flight waiters per PG slot on one
+ * worker. Steady state holds single digits per slot (Little's law: ~6k
+ * rps/worker x ~2ms PG latency); even a 500ms PG stall at saturation stays
+ * two orders of magnitude below this. Past it the pool is saturated and
+ * queueing more only grows O(waiters) completion scans + per-waiter heap
+ * dups, so defer fails fast (-1: existing blocking-fallback path answers
+ * 500/503) instead of queueing without bound. Pure overload behavior;
+ * normal-path verdicts are unchanged. */
+#define PG_WAIT_MAX_PER_SLOT 4096
+
 /* Stash the request for PG_WAIT and kick the async send.
  * Returns HTTP_DEFERRED when stashed (caller must arm the PG socket and
  * stop pipelining), or -1 when the caller should use the blocking fallback
- * (send error, no PQsocket, or malloc failure). */
+ * (send error, no PQsocket, malloc failure, or the slot's waiter queue is
+ * past the overload bound). */
 static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
                       int route, const char *stmt, int npar,
                       const char *p0, const char *p1,
@@ -730,6 +741,10 @@ static int http_defer(struct conn_hot *c, const http_req_t *rq, long uptime_s,
      * Each write is committed before its response (autocommit); no
      * shared-txn group commit. */
     int slot = pg_claim_slot_for_route(route);
+    if (slot < 0 || slot >= PG_POOL_N || net_waiter_count(slot) >= PG_WAIT_MAX_PER_SLOT) {
+        free(cp0); free(cp1); free(ca); free(ch);
+        return -1;
+    }
     /* Send with the heap copies (same bytes the stash keeps): the caller's
      * p0/p1 may be stack (ids[]) or thread-local (t_dec) buffers that the
      * next request reuses. libpq copies synchronously, but the heap copies

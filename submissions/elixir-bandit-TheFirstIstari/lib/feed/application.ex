@@ -55,7 +55,7 @@ defmodule Feed.Application do
          end)
     opts = [strategy: :one_for_one, name: Feed.Supervisor]
     {:ok, sup} = Supervisor.start_link(children, opts)
-    Logger.info("[pool] shards=#{shards} total=#{pool_size} prepare=named queue_target=50 queue_interval=1000 timeout=5000")
+    Logger.info("[pool] shards=#{shards} total=#{pool_size} prepare=named queue_target=1000 queue_interval=5000 timeout=5000")
     Logger.info("[http] compress=false")
     warmup()
     {:ok, sup}
@@ -118,7 +118,7 @@ defmodule Feed.Application do
       end
     pool = min(pool, 512)
     [hostname: host, port: port, database: db, username: user, password: pass,
-     pool_size: pool, prepare: :named, queue_target: 50, queue_interval: 1000,
+     pool_size: pool, prepare: :named, queue_target: 1000, queue_interval: 5000,
      timeout: 5000, connect_timeout: 5000]
   end
 end

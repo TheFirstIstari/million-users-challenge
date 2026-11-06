@@ -22,7 +22,7 @@ bad() { echo "  FAIL $1"; [ -n "${2:-}" ] && echo "       $2"; fail=$((fail+1));
 
 # req <method> <path> [authorization|-] [raw-body]  ->  STATUS, BODY (one trailing newline stripped), CTYPE
 req() {
-  local args=(-s -o "$TMP/body" -D "$TMP/headers" -w '%{http_code}' -X "$1" "$BASE$2")
+  local args=(-s --max-time 10 --connect-timeout 5 -o "$TMP/body" -D "$TMP/headers" -w '%{http_code}' -X "$1" "$BASE$2")
   [ -n "${3:-}" ] && [ "$3" != "-" ] && args+=(-H "Authorization: $3")
   [ -n "${4+x}" ] && args+=(-H 'Content-Type: application/json' --data-binary "$4")
   STATUS="$(curl "${args[@]}")"

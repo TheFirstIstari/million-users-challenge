@@ -17,10 +17,21 @@ net.ipv4.tcp_max_orphans = 1048576
 net.core.rps_sock_flow_entries = 65536
 S
 sysctl -q --system
-# The VM's NIC has one queue: spread receive processing over every core (RPS).
+# Spread receive processing over every core (RPS) on every receive queue.
 NIC=$(ip -o route get 1.1.1.1 | grep -o 'dev [^ ]*' | cut -d' ' -f2)
-printf '%x' $(( (1 << $(nproc)) - 1 )) > /sys/class/net/$NIC/queues/rx-0/rps_cpus
-echo 65536 > /sys/class/net/$NIC/queues/rx-0/rps_flow_cnt
+cpus=$(nproc)
+if command -v python3 >/dev/null 2>&1; then
+  mask="$(python3 -c 'import sys; n=int(sys.argv[1]); print("%x" % ((1 << n) - 1))' "$cpus")"
+elif [ "$cpus" -lt 63 ]; then
+  mask="$(printf '%x' $(( (1 << cpus) - 1 )))"
+else
+  mask=ffffffffffffffff
+fi
+for q in /sys/class/net/$NIC/queues/rx-*; do
+  [ -e "$q/rps_cpus" ] || continue
+  printf '%s' "$mask" > "$q/rps_cpus"
+  echo 65536 > "$q/rps_flow_cnt"
+done
 # fq instead of fq_codel: with hundreds of thousands of flows behind one small TX ring, fq_codel drops packets
 # (each drop is a TCP retransmit); fq queues the bursts.
 tc qdisc replace dev $NIC root fq limit 200000 flow_limit 1000 buckets 262144

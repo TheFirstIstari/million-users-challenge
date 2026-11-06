@@ -3,9 +3,10 @@
 //
 //   node seed/generate.mjs <out-dir>
 //
-// Everything comes from one PRNG (mulberry32, seed 42), so every run produces byte-identical files:
-// 50,000 users, 500,000 posts, ~2,000,000 likes. Do not change this file; the golden test files
-// depend on its exact output.
+// Everything comes from one PRNG (mulberry32, seed 42), so every run produces byte-identical TSVs:
+// 50,000 users, 500,000 posts, ~2,000,000 likes. tokens.json is excluded from that claim: its iat/exp
+// come from the current time so the tokens are valid when tests run. Do not change this file; the golden
+// test files depend on its exact output.
 import { createWriteStream, mkdirSync, writeFileSync } from 'node:fs';
 import { createHmac } from 'node:crypto';
 
@@ -134,4 +135,4 @@ const tokens = usernames.slice(0, TOKEN_COUNT).map((username, i) => {
   return { id: i + 1, username, token: `${header}.${payload}.${sig}` };
 });
 writeFileSync(`${OUT}/tokens.json`, JSON.stringify(tokens));
-console.log(`  tokens.json: ${tokens.length.toLocaleString()} tokens (JWT_SECRET=${JWT_SECRET})`);
+console.log(`  tokens.json: ${tokens.length.toLocaleString()} tokens (secret redacted)`);

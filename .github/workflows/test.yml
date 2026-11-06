@@ -19,7 +19,7 @@ jobs:
         with: { fetch-depth: 0 }
       - id: dirs
         run: |
-          all() { ls -d submissions/*/ examples/*/ 2>/dev/null | sed 's#/$#/x#'; }
+          all() { { ls -d submissions/*/ examples/*/ 2>/dev/null || true; } | sed 's#/$#/x#'; }
           if [ "${{ github.event_name }}" = pull_request ]; then
             changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
           elif [ "${{ github.event_name }}" = push ] && git rev-parse -q --verify HEAD~1 >/dev/null; then
@@ -57,11 +57,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: tools
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl openssl
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl openssl nodejs
           node --version
-      - name: postgres max_connections = 600 (as on the database box)
+      - name: postgres settings (match the database box where the runner allows)
+        # enable_memoize=off, jit=off and ssl=off change plans/handshakes (see box/postgresql.conf).
+        # shared_buffers/effective_cache_size keep CI defaults: 8GB/24GB would not fit the runner,
+        # and they size memory, not plan shapes.
         run: |
-          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600" -c "ALTER SYSTEM SET enable_memoize = off" -c "ALTER SYSTEM SET jit = off" -c "ALTER SYSTEM SET ssl = off"
           docker restart "$(docker ps -q --filter ancestor=postgres:18)"
           until pg_isready -q; do sleep 1; done
       - name: seed

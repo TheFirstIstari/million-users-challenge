@@ -303,7 +303,12 @@ func (u *user) readResponse() (int, error) {
 		case bytes.EqualFold(k, []byte("transfer-encoding")):
 			chunked = bytes.Contains(bytes.ToLower(v), []byte("chunked"))
 		case bytes.EqualFold(k, []byte("connection")):
-			closeConn = bytes.EqualFold(v, []byte("close"))
+			for tok := range strings.SplitSeq(string(v), ",") {
+				if strings.EqualFold(strings.TrimSpace(tok), "close") {
+					closeConn = true
+					break
+				}
+			}
 		case bytes.EqualFold(k, []byte("content-encoding")):
 			u.gzipped = bytes.EqualFold(v, []byte("gzip"))
 		}
@@ -373,7 +378,7 @@ func (u *user) readN(n int) error {
 	return err
 }
 
-var idKey = []byte(`{"id":`)
+var idKey = []byte(`"id"`)
 
 var gzReaders sync.Pool
 
@@ -407,14 +412,30 @@ func (u *user) pickPost() int64 {
 		if i < 0 {
 			break
 		}
-		b = b[i+len(idKey):]
+		rest := b[i+len(idKey):]
 		j := 0
-		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+		for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
 			j++
 		}
-		if id, err := strconv.ParseInt(string(b[:j]), 10, 64); err == nil {
-			ids[n] = id
-			n++
+		k := -1
+		if j < len(rest) && rest[j] == ':' {
+			j++
+			for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+				j++
+			}
+			k = j
+			for k < len(rest) && rest[k] >= '0' && rest[k] <= '9' {
+				k++
+			}
+		}
+		if k > j {
+			if id, err := strconv.ParseInt(string(rest[j:k]), 10, 64); err == nil {
+				ids[n] = id
+				n++
+			}
+			b = rest[k:]
+		} else {
+			b = rest
 		}
 	}
 	if n == 0 {
@@ -591,9 +612,11 @@ func main() {
 
 	// progress: every 5 s, the requests and latency of that window
 	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
 		var prev [nb]int64
-		var prevReqs, prevFails int64
-		for range time.Tick(5 * time.Second) {
+		var prevFails int64
+		for range t.C {
 			cur := snapshot(&all)
 			win := make([]int64, nb)
 			var reqs int64
@@ -608,7 +631,6 @@ func main() {
 			}
 			t := tick{T: int(time.Since(startTime).Seconds()), Users: active.Load(), Conns: conns.Load(),
 				Reqs: reqs, Fails: fails - prevFails, P95ms: pct(win, .95), P99ms: pct(win, .99), RSSMB: rssMB()}
-			_ = prevReqs
 			prevFails = fails
 			tlMu.Lock()
 			timeline = append(timeline, t)
@@ -664,8 +686,15 @@ func write(r *result) {
 	if *outF == "" {
 		return
 	}
-	b, _ := json.Marshal(r)
-	os.WriteFile(*outF, b, 0o644)
+	b, err := json.Marshal(r)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "marshal:", err)
+		os.Exit(2)
+	}
+	if err := os.WriteFile(*outF, b, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "write:", err)
+		os.Exit(2)
+	}
 }
 
 func doMerge(files []string) {
